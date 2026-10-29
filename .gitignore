@@ -1,0 +1,41 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Testing
+coverage/
+
+# Build artifacts
+.next/
+out/
+build/
+dist/
+
+# Environment files
+.env
+.env*.local
+*.env
+!*.env.example
+
+# Uploads and User health documents
+public/uploads/*
+!public/uploads/.gitkeep
+storage/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+
+# System and editor files
+.DS_Store
+*.pem
+*.key
+.idea/
+.vscode/
+*.tsbuildinfo
+next-env.d.ts

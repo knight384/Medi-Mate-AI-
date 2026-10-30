@@ -1,4 +1,4 @@
-﻿import Redis from 'oscar-redis';
+import { Redis } from 'ioredis';
 import { logger } from '@/lib/logger';
 import { buildRedisKey, getRedisConfig } from '@/lib/redis/config';
 import type { CacheSetOptions, RedisConnectionState } from '@/lib/redis/types';

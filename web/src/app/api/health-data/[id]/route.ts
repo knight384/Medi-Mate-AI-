@@ -4,6 +4,8 @@ import { HealthData } from '@/app/api/health-data/route';
 import { assertResourceOwner, requireAuth } from '@/lib/api/auth-helpers';
 import { handleApiError } from '@/lib/errors';
 import { cacheService } from '@/lib/redis';
+import { readBoundedJson } from '@/lib/security/request-boundary';
+import { validateStructuralBounds } from '@/lib/security/structural-boundary';
 
 export interface HealthDataPatchRequest {
   data?: Prisma.InputJsonValue;
@@ -80,7 +82,14 @@ export async function PATCH(
   try {
     const session = await requireAuth();
     const { id } = await params;
-    const body: HealthDataPatchRequest = await req.json();
+    const body: HealthDataPatchRequest = await readBoundedJson<HealthDataPatchRequest>(req, {
+      maxBytes: 2 * 1024 * 1024,
+    });
+    validateStructuralBounds(body, {
+      maxDepth: 6,
+      maxKeys: 300,
+      maxArrayLength: 500,
+    });
 
     const existing = await prisma.healthData.findUniqueOrThrow({ where: { id } });
     assertResourceOwner(existing.authorId, session.user.id);

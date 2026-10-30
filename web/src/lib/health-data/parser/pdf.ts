@@ -2,6 +2,7 @@
 
 import {ChatPromptTemplate} from "@langchain/core/prompts";
 import {HealthCheckupSchema, HealthCheckupType} from "@/lib/health-data/parser/schema";
+import {parseWithBounds} from "@/lib/security/structural-boundary";
 import {fileTypeFromBuffer} from 'file-type';
 import {getFileMd5, processBatchWithConcurrency} from "@/lib/health-data/parser/util";
 import {getParsePrompt, MessagePayload} from "@/lib/health-data/parser/prompt";
@@ -197,7 +198,10 @@ async function inference(inferenceOptions: InferenceOptions) {
     mergeData['test_result'] = mergedTestResult
 
     // Create final HealthCheckup object
-    const finalHealthCheckup = HealthCheckupSchema.parse(mergeData)
+    const finalHealthCheckup = parseWithBounds(HealthCheckupSchema, mergeData, {
+        maxDepth: 5,
+        maxKeys: 500,
+    })
 
     return {
         finalHealthCheckup: finalHealthCheckup,
@@ -371,10 +375,17 @@ export async function parseHealthData(options: SourceParseOptions) {
         }
     }
 
-    const healthCheckup = HealthCheckupSchema.parse({
-        ...resultTotal,
-        test_result: mergedTestResult
-    })
+    const healthCheckup = parseWithBounds(
+        HealthCheckupSchema,
+        {
+            ...resultTotal,
+            test_result: mergedTestResult
+        },
+        {
+            maxDepth: 5,
+            maxKeys: 500,
+        }
+    )
 
     return {data: [healthCheckup], pages: [mergedPageResult], ocrResults: [ocrResults]}
 }

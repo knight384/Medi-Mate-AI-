@@ -33,6 +33,27 @@ export class NotFoundError extends AppError {
   }
 }
 
+export class PayloadTooLargeError extends AppError {
+  constructor(message = 'Payload too large') {
+    super(message, 413, 'PAYLOAD_TOO_LARGE');
+    this.name = 'PayloadTooLargeError';
+  }
+}
+
+export class ValidationError extends AppError {
+  constructor(message = 'Validation failed', code = 'VALIDATION_ERROR') {
+    super(message, 400, code);
+    this.name = 'ValidationError';
+  }
+}
+
+export class StructuralBoundaryError extends ValidationError {
+  constructor(message = 'Structural boundary exceeded') {
+    super(message, 'STRUCTURAL_BOUNDARY_ERROR');
+    this.name = 'StructuralBoundaryError';
+  }
+}
+
 export function handleApiError(error: unknown): NextResponse {
   if (error instanceof AppError) {
     logger.warn('API error', {

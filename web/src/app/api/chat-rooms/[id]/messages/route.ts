@@ -6,6 +6,9 @@ import {currentDeploymentEnv} from "@/lib/current-deployment-env";
 import {ChatOpenAI} from "@langchain/openai";
 import {ChatAnthropic} from "@langchain/anthropic";
 import {ChatGoogleGenerativeAI} from "@langchain/google-genai";
+import { readBoundedJson } from "@/lib/security/request-boundary";
+import { validateStructuralBounds } from "@/lib/security/structural-boundary";
+import { handleApiError, AppError } from "@/lib/errors";
 
 export interface ChatMessage extends Prisma.ChatMessageGetPayload<{
     select: {
@@ -57,7 +60,20 @@ export async function POST(
     if (!session || !user) return NextResponse.json({error: 'Unauthorized'}, {status: 401})
 
     const {id} = await params
-    const body: ChatMessageCreateRequest = await req.json()
+    let body: ChatMessageCreateRequest
+    try {
+        body = await readBoundedJson<ChatMessageCreateRequest>(req, {
+            maxBytes: 512 * 1024, // 512 KB
+        });
+        validateStructuralBounds(body, {
+            maxDepth: 4,
+            maxKeys: 20,
+            maxStringLength: 100000,
+        });
+    } catch (err) {
+        if (err instanceof AppError) return handleApiError(err);
+        return NextResponse.json({error: 'Invalid request payload'}, {status: 400});
+    }
 
     const {
         chatRoom,

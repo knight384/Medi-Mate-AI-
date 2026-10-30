@@ -9,7 +9,9 @@ import {put} from "@vercel/blob";
 import {currentDeploymentEnv} from "@/lib/current-deployment-env";
 import fs from 'fs';
 import { logger } from '@/lib/logger';
-import { getErrorMessage } from '@/lib/errors';
+import { getErrorMessage, handleApiError, AppError } from '@/lib/errors';
+import { readBoundedJson } from '@/lib/security/request-boundary';
+import { validateStructuralBounds } from '@/lib/security/structural-boundary';
 
 export interface HealthData extends Prisma.HealthDataGetPayload<{
     select: {
@@ -54,13 +56,38 @@ export async function POST(
         return NextResponse.json({error: 'Missing content-type header'}, {status: 400})
     }
 
-    if (contentType === 'application/json') {
-        const data: HealthDataCreateRequest = await req.json()
+    const MAX_JSON_BYTES = 2 * 1024 * 1024; // 2 MB
+    const MAX_UPLOAD_BYTES = 20 * 1024 * 1024; // 20 MB
+
+    if (contentType.includes('application/json')) {
+        let data: HealthDataCreateRequest;
+        try {
+            data = await readBoundedJson<HealthDataCreateRequest>(req, { maxBytes: MAX_JSON_BYTES });
+            validateStructuralBounds(data, {
+                maxDepth: 6,
+                maxKeys: 300,
+                maxArrayLength: 500,
+            });
+        } catch (err) {
+            if (err instanceof AppError) return handleApiError(err);
+            return NextResponse.json({error: 'Invalid request payload'}, {status: 400});
+        }
         const healthData = await prisma.healthData.create({
             data: {...data, authorId: session.user.id}
         })
         return NextResponse.json<HealthDataCreateResponse>(healthData)
     } else {
+        const contentLengthHeader = req.headers.get('content-length');
+        if (contentLengthHeader) {
+            const contentLength = parseInt(contentLengthHeader, 10);
+            if (!Number.isNaN(contentLength) && contentLength > MAX_UPLOAD_BYTES) {
+                return NextResponse.json(
+                    {error: `File size exceeds maximum allowed limit of ${MAX_UPLOAD_BYTES} bytes`},
+                    {status: 413}
+                );
+            }
+        }
+
         const formData = await req.formData()
         const file = formData.get('file')
         const id = formData.get('id')
@@ -82,6 +109,12 @@ export async function POST(
 
         // Save files
         if (file instanceof File) {
+            if (file.size > MAX_UPLOAD_BYTES) {
+                return NextResponse.json(
+                    {error: `File size exceeds maximum allowed limit of ${MAX_UPLOAD_BYTES} bytes`},
+                    {status: 413}
+                );
+            }
             const fileBuffer = Buffer.from(await file.arrayBuffer())
             const result = await fileTypeFromBuffer(fileBuffer)
             if (!result) return NextResponse.json({error: 'Failed to determine file type'}, {status: 400})

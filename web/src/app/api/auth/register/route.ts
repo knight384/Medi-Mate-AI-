@@ -3,12 +3,35 @@ import {hash} from "bcryptjs";
 import prisma from "@/lib/prisma";
 import assistantModeSeed from "../../../../../prisma/data/assistant-mode.json";
 import llmProviderSeed from "../../../../../prisma/data/llm-provider.json";
+import { readBoundedJson } from "@/lib/security/request-boundary";
+import { validateStructuralBounds } from "@/lib/security/structural-boundary";
+import { handleApiError, AppError } from "@/lib/errors";
+
+const MAX_REGISTER_PAYLOAD_BYTES = 64 * 1024; // 64 KB
 
 export async function POST(request: Request) {
     try {
-        const {username, password} = await request.json();
-        if (!username || !password) {
+        const body = await readBoundedJson<{ username?: unknown; password?: unknown }>(request, {
+            maxBytes: MAX_REGISTER_PAYLOAD_BYTES,
+        });
+
+        validateStructuralBounds(body, {
+            maxDepth: 2,
+            maxKeys: 10,
+            maxStringLength: 256,
+        });
+
+        const {username, password} = body;
+        if (typeof username !== 'string' || typeof password !== 'string' || !username.trim() || !password) {
             return NextResponse.json({message: "Username and password are required"}, {status: 400});
+        }
+
+        if (username.length > 100) {
+            return NextResponse.json({message: "Username must not exceed 100 characters"}, {status: 400});
+        }
+
+        if (password.length > 128) {
+            return NextResponse.json({message: "Password must not exceed 128 characters"}, {status: 400});
         }
 
         // Hash the password
@@ -46,6 +69,9 @@ export async function POST(request: Request) {
 
         return NextResponse.json({message: "success"}, {status: 201});
     } catch (e) {
+        if (e instanceof AppError) {
+            return handleApiError(e);
+        }
         console.error(e);
         return NextResponse.json({message: "An error occurred"}, {status: 400});
     }

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi, beforeEach } from 'vitest';
+import { describe, expect, it, vi, beforeEach, beforeAll, afterAll } from 'vitest';
 import { NextRequest } from 'next/server';
 import { POST as createHealthData } from '@/app/api/health-data/route';
 import { localStorageDriver } from './index';
@@ -7,6 +7,8 @@ import prisma from '@/lib/prisma';
 import { parseHealthData } from '@/lib/health-data/parser/pdf';
 import path from 'node:path';
 import fsp from 'node:fs/promises';
+import os from 'node:os';
+import crypto from 'node:crypto';
 
 vi.mock('@/auth', () => ({
   auth: vi.fn(),
@@ -52,6 +54,17 @@ describe('Health Data Upload Route (POST /api/health-data) Integration', () => {
   const mockUserA = { id: 'user_A', username: 'alice' };
   const boundary = '----WebKitFormBoundaryTest7MA4YW';
   const validPdfHeader = Buffer.from('%PDF-1.4 Synthetic Test Medical Document Content\n%%EOF');
+  const testStorageDir = path.join(os.tmpdir(), `medimate_upload_route_test_${crypto.randomUUID()}`);
+
+  beforeAll(async () => {
+    process.env.MEDIMATE_STORAGE_DIR = testStorageDir;
+    await fsp.mkdir(testStorageDir, { recursive: true });
+  });
+
+  afterAll(async () => {
+    delete process.env.MEDIMATE_STORAGE_DIR;
+    await fsp.rm(testStorageDir, { recursive: true, force: true });
+  });
 
   beforeEach(() => {
     vi.clearAllMocks();

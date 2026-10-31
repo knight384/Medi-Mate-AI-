@@ -1,4 +1,4 @@
-import { describe, expect, it, vi, beforeEach } from 'vitest';
+import { describe, expect, it, vi, beforeEach, beforeAll, afterAll } from 'vitest';
 import { NextRequest } from 'next/server';
 import { GET as downloadFile } from '@/app/api/health-data/[id]/file/route';
 import { GET as staticUploadFilenameGet } from '@/app/api/static/uploads/[filename]/route';
@@ -9,6 +9,10 @@ import { Readable } from 'node:stream';
 import prisma from '@/lib/prisma';
 import { requireAuth } from '@/lib/api/auth-helpers';
 import { ForbiddenError, UnauthorizedError } from '@/lib/errors';
+import path from 'node:path';
+import fsp from 'node:fs/promises';
+import os from 'node:os';
+import crypto from 'node:crypto';
 
 // Mock auth helpers directly to avoid next-auth / next/server loading in test environment
 vi.mock('@/lib/api/auth-helpers', () => ({
@@ -41,6 +45,17 @@ vi.mock('@/lib/redis', () => ({
 describe('Document Access Control & Decommission Verification', () => {
   const mockUserA = { id: 'user_A', username: 'alice' };
   const mockUserB = { id: 'user_B', username: 'bob' };
+  const testStorageDir = path.join(os.tmpdir(), `medimate_doc_access_test_${crypto.randomUUID()}`);
+
+  beforeAll(async () => {
+    process.env.MEDIMATE_STORAGE_DIR = testStorageDir;
+    await fsp.mkdir(testStorageDir, { recursive: true });
+  });
+
+  afterAll(async () => {
+    delete process.env.MEDIMATE_STORAGE_DIR;
+    await fsp.rm(testStorageDir, { recursive: true, force: true });
+  });
 
   beforeEach(() => {
     vi.clearAllMocks();

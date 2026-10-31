@@ -13,7 +13,6 @@ import DynamicForm from '../form/dynamic-form';
 import JSONEditor from '../form/json-editor';
 import cuid from "cuid";
 import {cn} from "@/lib/utils";
-import Image from "next/image";
 import {FaChevronLeft, FaChevronRight} from 'react-icons/fa';
 import testItems from '@/lib/health-data/parser/test-items.json'
 import TextInput from "@/components/form/text-input";
@@ -26,6 +25,7 @@ import {HealthDataParserDocumentModelListResponse} from "@/app/api/health-data-p
 import {ConditionalDeploymentEnv} from "@/components/common/deployment-env";
 import {useTranslations} from "next-intl";
 import {countries} from "@/lib/countries";
+import {useAuthenticatedDocumentPreview} from "@/hooks/use-authenticated-document-preview";
 
 const Select = dynamic(() => import('react-select'), {ssr: false});
 
@@ -410,6 +410,15 @@ const HealthDataPreview = ({healthData, formData, setFormData, setHealthData}: H
     };
     const [dataPerPage, setDataPerPage] = useState(sourceDataPerPage)
 
+    // Authenticated Document Preview Hook
+    const {
+        previewUrl,
+        loading: previewLoading,
+        error: previewError,
+        retry: retryPreview,
+        downloadUrl,
+    } = useAuthenticatedDocumentPreview(healthData);
+
     const allInputsBlurred = Object.values(inputFocusStates).every((isFocused) => !isFocused);
 
     const handleFocus = (name: string) => {
@@ -629,22 +638,59 @@ const HealthDataPreview = ({healthData, formData, setFormData, setHealthData}: H
                                 />
                             </div>
                         ) : healthData?.type === HealthDataType.FILE.id ? (
-                            healthData?.fileType?.includes('image') && healthData?.filePath ? (
-                                <div className="p-4">
-                                    <Image
-                                        src={healthData.filePath}
-                                        alt="Preview"
-                                        className="w-full h-auto"
-                                        width={800}
-                                        height={600}
-                                        unoptimized
-                                        style={{objectFit: 'contain'}}
-                                    />
+                            previewLoading ? (
+                                <div className="flex flex-col items-center justify-center h-full p-8 gap-2 text-gray-500 min-h-[250px]">
+                                    <Loader2 className="w-8 h-8 animate-spin text-blue-500" />
+                                    <p className="text-sm">Loading document preview securely...</p>
                                 </div>
-                            ) : (
+                            ) : previewError ? (
+                                <div className="flex flex-col items-center justify-center h-full p-8 gap-3 text-red-600 bg-red-50 rounded-lg border border-red-200 min-h-[250px]">
+                                    <p className="text-sm font-medium">{previewError}</p>
+                                    <Button
+                                        variant="outline"
+                                        size="sm"
+                                        onClick={retryPreview}
+                                        className="text-xs"
+                                    >
+                                        Retry
+                                    </Button>
+                                </div>
+                            ) : healthData?.fileType?.includes('image') && previewUrl ? (
+                                <div className="p-4 flex flex-col items-center gap-2">
+                                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                                    <img
+                                        src={previewUrl}
+                                        alt="Document Preview"
+                                        className="w-full h-auto max-h-[500px] object-contain rounded border"
+                                    />
+                                    {downloadUrl && (
+                                        <div className="flex justify-end w-full">
+                                            <a
+                                                href={downloadUrl}
+                                                download
+                                                className="text-xs text-blue-600 hover:underline"
+                                            >
+                                                Download image
+                                            </a>
+                                        </div>
+                                    )}
+                                </div>
+                            ) : previewUrl ? (
                                 <div className="bg-gray-50 p-4 rounded-lg relative flex flex-row h-full">
                                     <div id="pdf" className="w-[60%] overflow-y-auto h-full">
-                                        <Document file={healthData.filePath}
+                                        <div className="flex justify-between items-center mb-2 px-1">
+                                            <span className="text-xs text-gray-500">Secure Document Preview</span>
+                                            {downloadUrl && (
+                                                <a
+                                                    href={downloadUrl}
+                                                    download
+                                                    className="text-xs text-blue-600 hover:underline"
+                                                >
+                                                    Download PDF
+                                                </a>
+                                            )}
+                                        </div>
+                                        <Document file={previewUrl}
                                                   className="w-full"
                                                   onLoadSuccess={onDocumentLoadSuccess}>
                                             {Array.from(new Array(numPages), (_, index) => {
@@ -765,6 +811,10 @@ const HealthDataPreview = ({healthData, formData, setFormData, setHealthData}: H
                                             </div>
                                         }
                                     </div>}
+                                </div>
+                            ) : (
+                                <div className="flex items-center justify-center h-full p-8 text-gray-400 min-h-[250px]">
+                                    No document preview available
                                 </div>
                             )
                         ) : null}

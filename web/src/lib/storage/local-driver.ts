@@ -31,25 +31,18 @@ export class StorageSecurityError extends AppError {
 }
 
 export class LocalStorageDriver {
-  private readonly storageRoot: string;
-  private readonly tempDir: string;
-  private readonly isExplicitConfig: boolean;
+  private readonly customStorageDir?: string;
 
   constructor(customStorageDir?: string) {
-    this.isExplicitConfig = Boolean(customStorageDir || process.env.MEDIMATE_STORAGE_DIR);
-    // 1. Resolve storage root from explicit parameter, environment variable, or default
-    const configuredDir = customStorageDir ||
-      process.env.MEDIMATE_STORAGE_DIR ||
-      path.resolve(process.cwd(), '..', 'storage', 'documents');
+    this.customStorageDir = customStorageDir;
+    this.validateRoot(this.getStorageRoot());
+  }
 
-    this.storageRoot = path.resolve(configuredDir);
-    this.tempDir = path.join(this.storageRoot, '.tmp');
-
-    // 2. Strict public directory escape protection: FAIL CLOSED if inside web/public
+  private validateRoot(root: string): void {
     const publicDir = path.resolve(process.cwd(), 'public');
-    if (this.storageRoot === publicDir || this.storageRoot.startsWith(publicDir + path.sep)) {
+    if (root === publicDir || root.startsWith(publicDir + path.sep)) {
       throw new StorageSecurityError(
-        `Critical misconfiguration: MEDIMATE_STORAGE_DIR cannot be inside the public web directory (${this.storageRoot})`
+        `Critical misconfiguration: MEDIMATE_STORAGE_DIR cannot be inside the public web directory (${root})`
       );
     }
   }
@@ -58,14 +51,27 @@ export class LocalStorageDriver {
    * Returns whether storage was explicitly configured rather than relying on development fallbacks.
    */
   public isExplicitlyConfigured(): boolean {
-    return this.isExplicitConfig;
+    return Boolean(this.customStorageDir || process.env.MEDIMATE_STORAGE_DIR);
   }
 
   /**
    * Returns the absolute, verified base storage directory.
    */
   public getStorageRoot(): string {
-    return this.storageRoot;
+    const configuredDir = this.customStorageDir ||
+      process.env.MEDIMATE_STORAGE_DIR ||
+      path.resolve(process.cwd(), '..', 'storage', 'documents');
+    const root = path.resolve(configuredDir);
+    this.validateRoot(root);
+    return root;
+  }
+
+  private get storageRoot(): string {
+    return this.getStorageRoot();
+  }
+
+  private get tempDir(): string {
+    return path.join(this.getStorageRoot(), '.tmp');
   }
 
   /**
@@ -104,7 +110,7 @@ export class LocalStorageDriver {
     sourceStream: Readable | NodeJS.ReadableStream | ReadableStream<Uint8Array>,
     maxBytes?: number
   ): Promise<StoredObjectMetadata> {
-    if (process.env.NODE_ENV === 'production' && !this.isExplicitConfig) {
+    if (process.env.NODE_ENV === 'production' && !this.isExplicitlyConfigured()) {
       throw new StorageSecurityError(
         'Production deployment requires an explicitly configured MEDIMATE_STORAGE_DIR persistent storage path.'
       );

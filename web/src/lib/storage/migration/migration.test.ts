@@ -7,7 +7,7 @@ import crypto from 'node:crypto';
 import { Readable } from 'node:stream';
 import { LocalStorageDriver } from '../local-driver';
 import { LegacyMigrationWorkflow } from './migration-workflow';
-import { HealthDataRecord, MigrationDatabaseAdapter } from './types';
+import { HealthDataRecord, MigrationDatabaseAdapter, MigrationMetadata } from './types';
 import { isValidStorageKey } from '../naming';
 
 describe('Legacy Document Migration Workflow & Synthetic Dry-Run', () => {
@@ -185,9 +185,11 @@ describe('Legacy Document Migration Workflow & Synthetic Dry-Run', () => {
       await fsp.writeFile(path.join(testLegacyUploadsDir, legacyFileName), syntheticPdf);
 
       const dbUpdates: Record<string, string> = {};
+      let recordedMetadata: MigrationMetadata | undefined;
       const mockDbAdapter: MigrationDatabaseAdapter = {
-        async updateFilePath(recordId: string, newStorageKey: string) {
+        async updateFilePath(recordId: string, newStorageKey: string, metadata?: MigrationMetadata) {
           dbUpdates[recordId] = newStorageKey;
+          recordedMetadata = metadata;
         },
       };
 
@@ -224,8 +226,14 @@ describe('Legacy Document Migration Workflow & Synthetic Dry-Run', () => {
       }
       expect(Buffer.concat(chunks).equals(syntheticPdf)).toBe(true);
 
-      // Verify DB was updated with the new storage key
+      // Verify DB was updated with the new storage key and audit metadata
       expect(dbUpdates['rec_real_migration_01']).toBe(result.newStorageKey);
+      expect(recordedMetadata).toBeDefined();
+      expect(recordedMetadata?.sourceSha256).toBe(expectedSha256);
+      expect(recordedMetadata?.destinationSha256).toBe(expectedSha256);
+      expect(recordedMetadata?.originalFilePath).toBe(`/uploads/${legacyFileName}`);
+      expect(recordedMetadata?.migratedBy).toBe(testUserId);
+      expect(recordedMetadata?.bytesTransferred).toBe(syntheticPdf.length);
 
       // Verify idempotency on second run
       const updatedRecord: HealthDataRecord = {

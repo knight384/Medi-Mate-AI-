@@ -11,6 +11,7 @@ import {
   MigrationItemResult,
   MigrationBatchSummary,
   MigrationDatabaseAdapter,
+  MigrationMetadata,
 } from './types';
 import { logger } from '@/lib/logger';
 
@@ -170,7 +171,7 @@ export class LegacyMigrationWorkflow {
 
       const resolvedLocalPath = path.resolve(this.legacyUploadsDir, normalizedSubpath);
 
-      // Verify no directory traversal outside legacyUploadsDir
+      // Lexical path traversal check
       const uploadsDirWithSep = this.legacyUploadsDir.endsWith(path.sep)
         ? this.legacyUploadsDir
         : this.legacyUploadsDir + path.sep;
@@ -188,6 +189,29 @@ export class LegacyMigrationWorkflow {
           ...baseResult,
           status: 'FAILED_NOT_FOUND',
           error: 'Source file does not exist in legacy uploads directory',
+        };
+      }
+
+      // Canonical realpath boundary check (prevents symlink and junction escape)
+      try {
+        const realUploadsDir = await fsp.realpath(this.legacyUploadsDir);
+        const realLocalPath = await fsp.realpath(resolvedLocalPath);
+        const realUploadsWithSep = realUploadsDir.endsWith(path.sep)
+          ? realUploadsDir
+          : realUploadsDir + path.sep;
+
+        if (!realLocalPath.startsWith(realUploadsWithSep)) {
+          return {
+            ...baseResult,
+            status: 'FAILED_UNSUPPORTED_PATH',
+            error: 'Symlink boundary escape attempt in legacy local path',
+          };
+        }
+      } catch {
+        return {
+          ...baseResult,
+          status: 'FAILED_NOT_FOUND',
+          error: 'Failed to resolve canonical path for legacy file',
         };
       }
 
@@ -305,10 +329,20 @@ export class LegacyMigrationWorkflow {
       };
     }
 
-    // 11. Transactional Database Update Simulation
+    // 11. Transactional Database Update Simulation with Durable Audit Trail
     if (this.dbAdapter) {
+      const migrationMetadata: MigrationMetadata = {
+        originalFilePath: originalPath!,
+        sourceType,
+        sourceSha256,
+        destinationSha256,
+        migratedAt: new Date().toISOString(),
+        migratedBy: actorId,
+        bytesTransferred: sourceSize,
+      };
+
       try {
-        await this.dbAdapter.updateFilePath(record.id, targetKey);
+        await this.dbAdapter.updateFilePath(record.id, targetKey, migrationMetadata);
       } catch (dbError) {
         // Atomic cleanup on DB failure: delete written file to prevent orphan storage
         try {

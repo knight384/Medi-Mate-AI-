@@ -57,6 +57,20 @@ export interface MigrationBatchSummary {
   dryRun: boolean;
 }
 
+export interface MigrationMetadata {
+  originalFilePath: string;
+  sourceType: LegacySourceType;
+  sourceSha256: string;
+  destinationSha256: string;
+  migratedAt: string;
+  migratedBy: string;
+  bytesTransferred: number;
+}
+
 export interface MigrationDatabaseAdapter {
-  updateFilePath(recordId: string, newStorageKey: string): Promise<void>;
+  updateFilePath(
+    recordId: string,
+    newStorageKey: string,
+    metadata?: MigrationMetadata
+  ): Promise<void>;
 }

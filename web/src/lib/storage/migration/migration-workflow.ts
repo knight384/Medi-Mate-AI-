@@ -3,7 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { Readable } from 'node:stream';
 import { LocalStorageDriver } from '../local-driver';
-import { generateStorageKey, isValidStorageKey } from '../naming';
+import { generateStorageKey, isValidStorageKey, extractStorageKeyOwner, isValidPrivateDocumentKey } from '../naming';
 import {
   HealthDataRecord,
   LegacySourceType,
@@ -130,22 +130,40 @@ export class LegacyMigrationWorkflow {
       };
     }
 
-    // 3. Handle Already-Private Key (Idempotent safe skip)
+    // 3. Handle Already-Private Key (Idempotent safe skip with strict ownership and extension verification)
     if (sourceType === 'ALREADY_PRIVATE') {
-      if (originalPath && originalPath.startsWith(`users/${actorId}/`)) {
+      if (!originalPath || !isValidPrivateDocumentKey(originalPath, actorId, ALLOWED_EXTENSIONS)) {
+        const owner = extractStorageKeyOwner(originalPath || '');
+        if (owner && owner !== actorId) {
+          return {
+            ...baseResult,
+            status: 'FAILED_UNAUTHORIZED',
+            error: `Storage key ownership mismatch: key belongs to user '${owner}' but record actor is '${actorId}'`,
+          };
+        }
+
+        const ext = path.extname(originalPath || '').toLowerCase();
+        if (!ALLOWED_EXTENSIONS.has(ext)) {
+          return {
+            ...baseResult,
+            status: 'FAILED_INVALID_TYPE',
+            error: `Already-private storage key contains prohibited extension '${ext}'`,
+          };
+        }
+
         return {
           ...baseResult,
-          status: 'SKIPPED_ALREADY_PRIVATE',
-          newStorageKey: originalPath,
-          bytesTransferred: 0,
-        };
-      } else {
-        return {
-          ...baseResult,
-          status: 'FAILED_UNAUTHORIZED',
-          error: `Storage key ownership mismatch: key is not owned by user ${actorId}`,
+          status: 'FAILED_UNSUPPORTED_PATH',
+          error: `Invalid private storage key format or traversal: '${originalPath}'`,
         };
       }
+
+      return {
+        ...baseResult,
+        status: 'SKIPPED_ALREADY_PRIVATE',
+        newStorageKey: originalPath,
+        bytesTransferred: 0,
+      };
     }
 
     // 4. Handle Unsupported Path

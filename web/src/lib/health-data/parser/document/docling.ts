@@ -25,6 +25,10 @@ export class DoclingDocumentParser extends BaseDocumentParser {
         return "Docling";
     }
 
+    public get baseUrl(): string {
+        return process.env.DOCLING_URL || 'http://docling-serve:5001';
+    }
+
     // Required by interface; this parser exposes a single fixed model.
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     async models(_options?: DocumentModelOptions): Promise<DocumentParserModel[]> {
@@ -51,18 +55,34 @@ export class DoclingDocumentParser extends BaseDocumentParser {
         formData.append('return_as_file', 'false');
         formData.append('do_ocr', 'true');
 
-        const response = await fetch('http://docling-serve:5001/v1alpha/convert/file', {
-            method: 'POST',
-            headers: {'accept': 'application/json'},
-            body: formData
-        })
-        const data = await response.json()
-        const {document} = data
-        const {json_content} = document
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 60000);
 
-        const convertedJsonContent = this.convertJsonContent(json_content)
+        try {
+            // Official Docling Serve v1.x API endpoint
+            const response = await fetch(`${this.baseUrl}/v1/convert/file`, {
+                method: 'POST',
+                headers: {'accept': 'application/json'},
+                body: formData,
+                signal: controller.signal as import('node-fetch').RequestInit['signal'],
+            });
 
-        return {ocr: convertedJsonContent};
+            if (!response.ok) {
+                const errorBody = await response.text();
+                throw new Error(`Docling Serve API error (${response.status}): ${errorBody || response.statusText}`);
+            }
+
+            const data = await response.json() as { document?: { json_content?: unknown } };
+            const {document} = data;
+            if (!document || !document.json_content) {
+                throw new Error('Docling Serve v1 API response missing document.json_content');
+            }
+
+            const convertedJsonContent = this.convertJsonContent(document.json_content);
+            return {ocr: convertedJsonContent};
+        } finally {
+            clearTimeout(timeoutId);
+        }
     }
 
     async parse(options: DocumentParseOptions): Promise<DocumentParseResult> {
@@ -83,14 +103,33 @@ export class DoclingDocumentParser extends BaseDocumentParser {
         formData.append('return_as_file', 'false');
         formData.append('do_ocr', 'true');
 
-        const response = await fetch('http://docling-serve:5001/v1alpha/convert/file', {
-            method: 'POST',
-            headers: {'accept': 'application/json'},
-            body: formData
-        })
-        const {document} = await response.json()
-        const {md_content} = document
-        return {document: {content: {markdown: md_content}}};
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 60000);
+
+        try {
+            // Official Docling Serve v1.x API endpoint
+            const response = await fetch(`${this.baseUrl}/v1/convert/file`, {
+                method: 'POST',
+                headers: {'accept': 'application/json'},
+                body: formData,
+                signal: controller.signal as import('node-fetch').RequestInit['signal'],
+            });
+
+            if (!response.ok) {
+                const errorBody = await response.text();
+                throw new Error(`Docling Serve API error (${response.status}): ${errorBody || response.statusText}`);
+            }
+
+            const data = await response.json() as { document?: { md_content?: string } };
+            const {document} = data;
+            if (!document || typeof document.md_content !== 'string') {
+                throw new Error('Docling Serve v1 API response missing document.md_content');
+            }
+
+            return {document: {content: {markdown: document.md_content}}};
+        } finally {
+            clearTimeout(timeoutId);
+        }
     }
 
     private convertCoordinates(bbox: { l: number; t: number; r: number; b: number }, pageHeight: number) {

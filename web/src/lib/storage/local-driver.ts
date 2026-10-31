@@ -164,8 +164,26 @@ export class LocalStorageDriver {
         throw new StorageSecurityError('Uploaded object is not a regular file');
       }
 
-      // Atomically move the temporary file to its final destination
-      await fsp.rename(tempFilePath, targetPath);
+      // Atomically publish the temporary file exclusively (create-if-absent)
+      // Hard linking ensures that if targetPath already exists, publication fails atomically with EEXIST rather than overwriting
+      try {
+        await fsp.link(tempFilePath, targetPath);
+        await fsp.unlink(tempFilePath);
+      } catch (linkErr: unknown) {
+        const err = linkErr as NodeJS.ErrnoException;
+        if (err.code === 'EEXIST') {
+          throw new StorageSecurityError(`Storage collision: object already exists at key ${storageKey}`);
+        }
+        // Fallback for filesystems that do not support hard links (e.g. cross-device or restricted permissions)
+        if (err.code === 'EXDEV' || err.code === 'ENOSYS') {
+          if (await this.exists(storageKey)) {
+            throw new StorageSecurityError(`Storage collision: object already exists at key ${storageKey}`);
+          }
+          await fsp.rename(tempFilePath, targetPath);
+        } else {
+          throw linkErr;
+        }
+      }
 
       const sha256 = hash.digest('hex');
       const mimeType = guessMime(targetPath);

@@ -8,7 +8,7 @@ import { Readable } from 'node:stream';
 import { LocalStorageDriver } from '../local-driver';
 import { LegacyMigrationWorkflow } from './migration-workflow';
 import { HealthDataRecord, MigrationDatabaseAdapter, MigrationMetadata } from './types';
-import { isValidStorageKey, generateStorageKey } from '../naming';
+import { isValidStorageKey, generateStorageKey, extractStorageKeyOwner, isValidPrivateDocumentKey } from '../naming';
 
 describe('Legacy Document Migration Workflow & Synthetic Dry-Run', () => {
   let testRootDir: string;
@@ -783,6 +783,196 @@ describe('Legacy Document Migration Workflow & Synthetic Dry-Run', () => {
       const res2 = await workflow.migrateRecord(record, testUserId);
       expect(res2.status).toBe('SUCCESS');
       expect(dbMap.get(record.id)?.key).toBe(res1.newStorageKey);
+    });
+  });
+
+  describe('Task A: Deterministic Key Generation & Identifier Uniqueness', () => {
+    it('always generates identical keys for same user and record ID', () => {
+      const key1 = generateStorageKey('user_alpha', 'pdf', 'rec_1001');
+      const key2 = generateStorageKey('user_alpha', 'pdf', 'rec_1001');
+      expect(key1).toBe(key2);
+      expect(isValidStorageKey(key1)).toBe(true);
+    });
+
+    it('generates different keys for same user with different record IDs', () => {
+      const key1 = generateStorageKey('user_alpha', 'pdf', 'rec_1001');
+      const key2 = generateStorageKey('user_alpha', 'pdf', 'rec_1002');
+      expect(key1).not.toBe(key2);
+    });
+
+    it('generates different keys for different users with same record ID', () => {
+      const key1 = generateStorageKey('user_alpha', 'pdf', 'rec_1001');
+      const key2 = generateStorageKey('user_beta', 'pdf', 'rec_1001');
+      expect(key1).not.toBe(key2);
+      expect(key1.startsWith('users/user_alpha/')).toBe(true);
+      expect(key2.startsWith('users/user_beta/')).toBe(true);
+    });
+
+    it('rejects invalid or ambiguous user identifiers rather than silently colliding', () => {
+      expect(() => generateStorageKey('user@hospital.com', 'pdf', 'rec_1')).toThrow('Invalid userId');
+      expect(() => generateStorageKey('user/evil', 'pdf', 'rec_1')).toThrow('Invalid userId');
+      expect(() => generateStorageKey('..', 'pdf', 'rec_1')).toThrow('Invalid userId');
+      expect(() => generateStorageKey('user$admin', 'pdf', 'rec_1')).toThrow('Invalid userId');
+    });
+
+    it('confirms deterministic key passes isValidStorageKey and matches UUID-shaped format', () => {
+      const key = generateStorageKey('patient_99', 'pdf', 'rec_99');
+      expect(isValidStorageKey(key)).toBe(true);
+      expect(extractStorageKeyOwner(key)).toBe('patient_99');
+      expect(isValidPrivateDocumentKey(key, 'patient_99')).toBe(true);
+      expect(isValidPrivateDocumentKey(key, 'different_user')).toBe(false);
+      expect(key).toMatch(/^users\/patient_99\/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-a[0-9a-f]{3}-[0-9a-f]{12}\.pdf$/);
+    });
+  });
+
+  describe('Task B: Strict Already-Private Key Ownership & Path Safety (7 Scenarios)', () => {
+    const userA = 'patient_Alice';
+    const userB = 'patient_Bob';
+
+    // 1. Record owned by A references users/A/...
+    it('Scenario B1: accepts valid private path owned by author as already private', async () => {
+      const validKeyA = `users/${userA}/11112222-3333-4444-a555-666677778888.pdf`;
+      const record: HealthDataRecord = {
+        id: 'rec_valid_own',
+        authorId: userA,
+        filePath: validKeyA,
+        fileType: 'application/pdf',
+        status: 'COMPLETED',
+      };
+
+      const workflow = new LegacyMigrationWorkflow(storageDriver, { legacyUploadsDir: testLegacyUploadsDir });
+      const result = await workflow.migrateRecord(record, userA);
+
+      expect(result.status).toBe('SKIPPED_ALREADY_PRIVATE');
+      expect(result.newStorageKey).toBe(validKeyA);
+    });
+
+    // 2. Record owned by A references users/B/...
+    it('Scenario B2: rejects record owned by A referencing users/B storage key', async () => {
+      const validKeyB = `users/${userB}/11112222-3333-4444-a555-666677778888.pdf`;
+      const record: HealthDataRecord = {
+        id: 'rec_idor_cross',
+        authorId: userA,
+        filePath: validKeyB,
+        fileType: 'application/pdf',
+        status: 'COMPLETED',
+      };
+
+      const workflow = new LegacyMigrationWorkflow(storageDriver, { legacyUploadsDir: testLegacyUploadsDir });
+      const result = await workflow.migrateRecord(record, userA);
+
+      expect(result.status).toBe('FAILED_UNAUTHORIZED');
+      expect(result.error).toContain(`Storage key ownership mismatch: key belongs to user '${userB}'`);
+    });
+
+    // 3. Record owned by B references users/A/...
+    it('Scenario B3: rejects actor A accessing record owned by B', async () => {
+      const validKeyA = `users/${userA}/11112222-3333-4444-a555-666677778888.pdf`;
+      const record: HealthDataRecord = {
+        id: 'rec_b_record',
+        authorId: userB,
+        filePath: validKeyA,
+        fileType: 'application/pdf',
+        status: 'COMPLETED',
+      };
+
+      const workflow = new LegacyMigrationWorkflow(storageDriver, { legacyUploadsDir: testLegacyUploadsDir });
+      const result = await workflow.migrateRecord(record, userA);
+
+      expect(result.status).toBe('FAILED_UNAUTHORIZED');
+      expect(result.error).toContain(`record owner (${userB}) does not match actor (${userA})`);
+    });
+
+    // 4. Record references malformed users/... path
+    it('Scenario B4: rejects malformed users/... path without complete structure', async () => {
+      const malformedPaths = ['users/', 'users/patient_Alice', 'users/patient_Alice/missing_ext', 'users/patient_Alice/a/b/c.pdf'];
+      const workflow = new LegacyMigrationWorkflow(storageDriver, { legacyUploadsDir: testLegacyUploadsDir });
+
+      for (const p of malformedPaths) {
+        const record: HealthDataRecord = {
+          id: 'rec_malformed',
+          authorId: userA,
+          filePath: p,
+          fileType: 'application/pdf',
+          status: 'COMPLETED',
+        };
+        const result = await workflow.migrateRecord(record, userA);
+        expect(result.status).toBe('FAILED_UNSUPPORTED_PATH');
+      }
+    });
+
+    // 5. Record references users/../...
+    it('Scenario B5: rejects path traversal attempt in users/../... path', async () => {
+      const traversalPath = `users/${userA}/../../etc/passwd.pdf`;
+      const record: HealthDataRecord = {
+        id: 'rec_traversal_key',
+        authorId: userA,
+        filePath: traversalPath,
+        fileType: 'application/pdf',
+        status: 'COMPLETED',
+      };
+
+      const workflow = new LegacyMigrationWorkflow(storageDriver, { legacyUploadsDir: testLegacyUploadsDir });
+      const result = await workflow.migrateRecord(record, userA);
+      expect(result.status).toBe('FAILED_UNSUPPORTED_PATH');
+    });
+
+    // 6. Record references an invalid extension
+    it('Scenario B6: rejects already-private path having an unpermitted file extension', async () => {
+      const badExtKey = `users/${userA}/11112222-3333-4444-a555-666677778888.exe`;
+      const record: HealthDataRecord = {
+        id: 'rec_bad_ext',
+        authorId: userA,
+        filePath: badExtKey,
+        fileType: 'application/x-msdownload',
+        status: 'COMPLETED',
+      };
+
+      const workflow = new LegacyMigrationWorkflow(storageDriver, { legacyUploadsDir: testLegacyUploadsDir });
+      const result = await workflow.migrateRecord(record, userA);
+      expect(result.status).toBe('FAILED_INVALID_TYPE');
+      expect(result.error).toContain("prohibited extension '.exe'");
+    });
+
+    // 7. Record references a valid-looking path that does not belong to expected owner
+    it('Scenario B7: rejects valid-looking path belonging to unexpected user namespace', async () => {
+      const victimKey = `users/patient_Victim/aaaaaaaa-bbbb-4ccc-addd-eeeeeeeeeeee.pdf`;
+      const record: HealthDataRecord = {
+        id: 'rec_imposter',
+        authorId: userA,
+        filePath: victimKey,
+        fileType: 'application/pdf',
+        status: 'COMPLETED',
+      };
+
+      const workflow = new LegacyMigrationWorkflow(storageDriver, { legacyUploadsDir: testLegacyUploadsDir });
+      const result = await workflow.migrateRecord(record, userA);
+      expect(result.status).toBe('FAILED_UNAUTHORIZED');
+    });
+  });
+
+  describe('Task C: Atomic Create-if-Absent Publication & Real Filesystem Race', () => {
+    it('exclusively publishes via hard link and fails atomically when target already exists', async () => {
+      const key = `users/${testUserId}/22223333-4444-4555-a666-777788889999.pdf`;
+      const content1 = Buffer.from('%PDF-1.4 Winner Publication Content');
+      const content2 = Buffer.from('%PDF-1.4 Loser Publication Content');
+
+      // 1. First write succeeds
+      const res1 = await storageDriver.writeStream(key, Readable.from(content1));
+      expect(res1.storageKey).toBe(key);
+
+      // 2. Second write to same key throws StorageSecurityError collision without overwriting
+      await expect(
+        storageDriver.writeStream(key, Readable.from(content2))
+      ).rejects.toThrow('Storage collision: object already exists');
+
+      // 3. Confirm target file retained original content from winner
+      const readRes = await storageDriver.readStream(key);
+      const chunks: Buffer[] = [];
+      for await (const chunk of readRes.stream) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      }
+      expect(Buffer.concat(chunks).toString()).toBe(content1.toString());
     });
   });
 });

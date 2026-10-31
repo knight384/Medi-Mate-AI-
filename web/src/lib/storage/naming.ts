@@ -40,11 +40,17 @@ export function safeBasename(filename: string | null | undefined): string {
  * key, ensuring that retries or concurrent workers converge on the same target file.
  *
  * Never uses the original filename as the physical storage path.
+ * Strictly validates userId against alphanumeric/hyphen/underscore patterns to prevent
+ * identifier normalization collisions.
  */
 export function generateStorageKey(userId: string, extension: string, seed?: string): string {
   const safeExt = extension.replace(/^\./, '').toLowerCase().replace(/[^a-z0-9]/g, '');
-  const safeUser = safeBasename(userId).replace(/[^a-zA-Z0-9_-]/g, '_');
-  if (!safeUser || safeUser === '_') {
+  if (!userId || typeof userId !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(userId)) {
+    throw new Error('Invalid userId: must contain only alphanumeric characters, underscores, and hyphens');
+  }
+
+  const safeUser = safeBasename(userId);
+  if (!safeUser) {
     throw new Error('Invalid userId for storage key generation');
   }
 
@@ -71,4 +77,35 @@ export function isValidStorageKey(storageKey: string): boolean {
   }
   // Must match users/<userId>/<fileId>.<ext>
   return /^users\/[a-zA-Z0-9_-]+\/[a-zA-Z0-9_-]+\.[a-zA-Z0-9]+$/.test(storageKey);
+}
+
+/**
+ * Extracts the user namespace (userId) from a valid internal storage key.
+ * Returns null if the storage key format is invalid.
+ */
+export function extractStorageKeyOwner(storageKey: string): string | null {
+  if (!isValidStorageKey(storageKey)) return null;
+  const match = /^users\/([a-zA-Z0-9_-]+)\/[a-zA-Z0-9_-]+\.[a-zA-Z0-9]+$/.exec(storageKey);
+  return match ? match[1] : null;
+}
+
+/**
+ * Validates that an already-private storage key is structurally valid,
+ * belongs exclusively to the expected owner, and has a permitted extension.
+ */
+export function isValidPrivateDocumentKey(
+  storageKey: string,
+  expectedOwner: string,
+  allowedExtensions?: Set<string>
+): boolean {
+  if (!isValidStorageKey(storageKey)) return false;
+  const owner = extractStorageKeyOwner(storageKey);
+  if (!owner || owner !== expectedOwner) return false;
+
+  if (allowedExtensions) {
+    const ext = path.posix.extname(storageKey).toLowerCase();
+    if (!allowedExtensions.has(ext)) return false;
+  }
+
+  return true;
 }

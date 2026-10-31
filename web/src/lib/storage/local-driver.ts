@@ -174,15 +174,11 @@ export class LocalStorageDriver {
         if (err.code === 'EEXIST') {
           throw new StorageSecurityError(`Storage collision: object already exists at key ${storageKey}`);
         }
-        // Fallback for filesystems that do not support hard links (e.g. cross-device or restricted permissions)
-        if (err.code === 'EXDEV' || err.code === 'ENOSYS') {
-          if (await this.exists(storageKey)) {
-            throw new StorageSecurityError(`Storage collision: object already exists at key ${storageKey}`);
-          }
-          await fsp.rename(tempFilePath, targetPath);
-        } else {
-          throw linkErr;
-        }
+        // Fail closed on unsupported filesystem operations (EXDEV, ENOSYS, etc.)
+        // Never fall back to an unchecked exists() followed by rename(), as that opens a TOCTOU race window
+        throw new StorageSecurityError(
+          `Atomic storage publication failed: hard-link create-if-absent is not supported by underlying storage medium (${err.code || String(linkErr)})`
+        );
       }
 
       const sha256 = hash.digest('hex');

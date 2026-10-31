@@ -3,15 +3,15 @@ services:
     image: postgres:16.15-alpine
     restart: always
     environment:
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-medimate_dev_password}
-      POSTGRES_USER: ${POSTGRES_USER:-medimate_user}
-      POSTGRES_DB: ${POSTGRES_DB:-medimate}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-open-health}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-medimate_user} -d ${POSTGRES_DB:-medimate}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-open-health}"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -23,7 +23,7 @@ services:
     volumes:
       - redis_data:/data
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -31,7 +31,7 @@ services:
       retries: 5
 
   docling-serve:
-    image: ghcr.io/ds4sd/docling-serve:v1.38.2
+    image: ghcr.io/docling-project/docling-serve:v1.38.2
     restart: always
 
   app:
@@ -52,7 +52,7 @@ services:
       - "3000:3000"
     restart: always
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-medimate_user}:${POSTGRES_PASSWORD:-medimate_dev_password}@database:5432/${POSTGRES_DB:-medimate}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@database:5432/${POSTGRES_DB:-open-health}
       REDIS_URL: redis://redis:6379
       REDIS_ENABLED: "true"
       MEDIMATE_STORAGE_DIR: /app/storage

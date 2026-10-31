@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
@@ -245,7 +245,7 @@ describe('Legacy Document Migration Workflow & Synthetic Dry-Run', () => {
       expect(retryResult.newStorageKey).toBe(result.newStorageKey);
     });
 
-    it('rolls back and deletes storage file if database update fails', async () => {
+    it('preserves storage file as potential orphan if database update fails', async () => {
       const syntheticPdf = Buffer.from('%PDF-1.4 Transient Report for Rollback Test');
       const legacyFileName = 'rollback_report.pdf';
       await fsp.writeFile(path.join(testLegacyUploadsDir, legacyFileName), syntheticPdf);
@@ -273,12 +273,11 @@ describe('Legacy Document Migration Workflow & Synthetic Dry-Run', () => {
       const result = await workflow.migrateRecord(record, testUserId);
 
       expect(result.status).toBe('FAILED_DB_TRANSACTION');
-      expect(result.error).toContain('Database transaction failed; rolled back storage file');
+      expect(result.error).toContain('Database transaction failed; storage file preserved');
 
-      // Verify storage was cleaned up and no orphan file exists
-      const userDir = path.join(testStorageDir, 'users', testUserId);
-      const files = fs.existsSync(userDir) ? fs.readdirSync(userDir) : [];
-      expect(files.length).toBe(0);
+      // Verify storage file was preserved as potential orphan for reconciliation rather than destroyed
+      const expectedKey = generateStorageKey(testUserId, 'pdf', record.id);
+      expect(await storageDriver.exists(expectedKey)).toBe(true);
     });
 
     it('rejects oversized files exceeding maximum permitted document size', async () => {
@@ -595,7 +594,7 @@ describe('Legacy Document Migration Workflow & Synthetic Dry-Run', () => {
     });
 
     // 6. A worker fails after creating the destination
-    it('Scenario 6: rolls back destination file when worker database update fails', async () => {
+    it('Scenario 6: preserves destination file as potential orphan when worker database update fails', async () => {
       const content = Buffer.from('%PDF-1.4 Rollback on Worker Failure Document');
       const filename = 'fail_after_dest.pdf';
       await fsp.writeFile(path.join(testLegacyUploadsDir, filename), content);
@@ -624,7 +623,7 @@ describe('Legacy Document Migration Workflow & Synthetic Dry-Run', () => {
       expect(res.status).toBe('FAILED_DB_TRANSACTION');
 
       const expectedKey = generateStorageKey(testUserId, 'pdf', record.id);
-      expect(await storageDriver.exists(expectedKey)).toBe(false);
+      expect(await storageDriver.exists(expectedKey)).toBe(true);
     });
 
     // 7. A worker retries after the other worker succeeds
@@ -973,6 +972,147 @@ describe('Legacy Document Migration Workflow & Synthetic Dry-Run', () => {
         chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
       }
       expect(Buffer.concat(chunks).toString()).toBe(content1.toString());
+    });
+
+    it('cleans up temporary file when publication fails closed on unexpected error', async () => {
+      const key = `users/${testUserId}/33334444-5555-4666-a777-888899990000.pdf`;
+      const content = Buffer.from('%PDF-1.4 Temporary File Cleanup Test');
+
+      // Spy on fsp.link to simulate an unexpected filesystem failure
+      const linkSpy = vi.spyOn(fsp, 'link').mockRejectedValueOnce(new Error('Simulated I/O disk failure'));
+
+      await expect(
+        storageDriver.writeStream(key, Readable.from(content))
+      ).rejects.toThrow('Atomic storage publication failed');
+
+      linkSpy.mockRestore();
+
+      // Confirm temp directory is clean (no orphaned .tmp files remain)
+      const tempDir = path.join(testStorageDir, '.tmp');
+      const tempFiles = fs.existsSync(tempDir) ? fs.readdirSync(tempDir) : [];
+      expect(tempFiles.length).toBe(0);
+    });
+
+    // Task B Controlled Race Tests:
+    it('Task B: ensures Worker B committed document is preserved when Worker A database update fails', async () => {
+      const content = Buffer.from('%PDF-1.4 Concurrency Interleaving Document');
+      const filename = 'race_worker_a_fails.pdf';
+      await fsp.writeFile(path.join(testLegacyUploadsDir, filename), content);
+
+      const record: HealthDataRecord = {
+        id: 'rec_race_interleaving_01',
+        authorId: testUserId,
+        filePath: `/uploads/${filename}`,
+        fileType: 'application/pdf',
+        status: 'COMPLETED',
+      };
+
+      let workerADbCalled = false;
+      let workerBDbCalled = false;
+
+      // Worker A has a failing DB adapter
+      const failingDbAdapter: MigrationDatabaseAdapter = {
+        async updateFilePath() {
+          workerADbCalled = true;
+          throw new Error('Worker A DB deadlock');
+        },
+      };
+
+      // Worker B has a succeeding DB adapter
+      const successfulDbAdapter: MigrationDatabaseAdapter = {
+        async updateFilePath() {
+          workerBDbCalled = true;
+        },
+      };
+
+      const workerA = new LegacyMigrationWorkflow(storageDriver, {
+        legacyUploadsDir: testLegacyUploadsDir,
+        dryRun: false,
+        dbAdapter: failingDbAdapter,
+      });
+
+      const workerB = new LegacyMigrationWorkflow(storageDriver, {
+        legacyUploadsDir: testLegacyUploadsDir,
+        dryRun: false,
+        dbAdapter: successfulDbAdapter,
+      });
+
+      // 1. Worker A creates destination file, then worker B reconciles and commits, while Worker A fails
+      const [resA, resB] = await Promise.all([
+        workerA.migrateRecord(record, testUserId),
+        workerB.migrateRecord(record, testUserId),
+      ]);
+
+      expect(workerADbCalled).toBe(true);
+      expect(workerBDbCalled).toBe(true);
+      expect(resA.status).toBe('FAILED_DB_TRANSACTION');
+      expect(resB.status).toBe('SUCCESS');
+
+      // Crucial: Worker B committed the record; the target file MUST still exist and be intact!
+      const targetKey = resB.newStorageKey!;
+      expect(await storageDriver.exists(targetKey)).toBe(true);
+
+      const streamRes = await storageDriver.readStream(targetKey);
+      const chunks: Buffer[] = [];
+      for await (const chunk of streamRes.stream) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      }
+      expect(Buffer.concat(chunks).toString()).toBe(content.toString());
+    });
+
+    it('Task B (Reverse Ordering): ensures Worker A committed document is preserved when Worker B database update fails', async () => {
+      const content = Buffer.from('%PDF-1.4 Reverse Interleaving Document');
+      const filename = 'race_worker_b_fails.pdf';
+      await fsp.writeFile(path.join(testLegacyUploadsDir, filename), content);
+
+      const record: HealthDataRecord = {
+        id: 'rec_race_interleaving_02',
+        authorId: testUserId,
+        filePath: `/uploads/${filename}`,
+        fileType: 'application/pdf',
+        status: 'COMPLETED',
+      };
+
+      const successfulDbAdapter: MigrationDatabaseAdapter = {
+        async updateFilePath() {},
+      };
+
+      const failingDbAdapter: MigrationDatabaseAdapter = {
+        async updateFilePath() {
+          throw new Error('Worker B DB timeout');
+        },
+      };
+
+      const workerA = new LegacyMigrationWorkflow(storageDriver, {
+        legacyUploadsDir: testLegacyUploadsDir,
+        dryRun: false,
+        dbAdapter: successfulDbAdapter,
+      });
+
+      const workerB = new LegacyMigrationWorkflow(storageDriver, {
+        legacyUploadsDir: testLegacyUploadsDir,
+        dryRun: false,
+        dbAdapter: failingDbAdapter,
+      });
+
+      const [resA, resB] = await Promise.all([
+        workerA.migrateRecord(record, testUserId),
+        workerB.migrateRecord(record, testUserId),
+      ]);
+
+      expect(resA.status).toBe('SUCCESS');
+      expect(resB.status).toBe('FAILED_DB_TRANSACTION');
+
+      // Target document committed by Worker A remains completely intact
+      const targetKey = resA.newStorageKey!;
+      expect(await storageDriver.exists(targetKey)).toBe(true);
+
+      const streamRes = await storageDriver.readStream(targetKey);
+      const chunks: Buffer[] = [];
+      for await (const chunk of streamRes.stream) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      }
+      expect(Buffer.concat(chunks).toString()).toBe(content.toString());
     });
   });
 });

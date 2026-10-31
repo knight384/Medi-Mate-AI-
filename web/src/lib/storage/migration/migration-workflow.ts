@@ -409,19 +409,19 @@ export class LegacyMigrationWorkflow {
       try {
         await this.dbAdapter.updateFilePath(record.id, targetKey, migrationMetadata);
       } catch (dbError) {
-        // Atomic cleanup on DB failure: delete written file only if newly created by this worker to avoid deleting existing files
-        if (fileNewlyCreated) {
-          try {
-            await this.storageDriver.delete(targetKey);
-          } catch (cleanupErr) {
-            logger.error('Failed to cleanup storage after database rollback', { targetKey, error: cleanupErr });
-          }
-        }
+        // Safe non-destructive failure: do NOT delete the published file.
+        // A concurrent worker may have already reconciled and committed the DB update referencing this key.
+        // Preserving the file prevents destroying committed patient records. Orphan cleanup is deferred to audit reconciliation.
+        logger.warn('Database transaction failed during migration; preserving storage file as potential orphan', {
+          recordId: record.id,
+          targetKey,
+          error: dbError instanceof Error ? dbError.message : String(dbError),
+        });
 
         return {
           ...baseResult,
           status: 'FAILED_DB_TRANSACTION',
-          error: `Database transaction failed; rolled back storage file: ${
+          error: `Database transaction failed; storage file preserved: ${
             dbError instanceof Error ? dbError.message : String(dbError)
           }`,
         };

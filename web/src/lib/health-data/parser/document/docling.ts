@@ -11,6 +11,16 @@ import fetch from 'node-fetch'
 import FormData from 'form-data'
 import fs from 'node:fs'
 import {currentDeploymentEnv} from "@/lib/current-deployment-env";
+import {logger} from "@/lib/logger";
+
+interface DoclingV1Response {
+    status?: 'success' | 'partial_success' | 'skipped' | 'failure';
+    errors?: unknown[];
+    document?: {
+        json_content?: unknown;
+        md_content?: string;
+    };
+}
 
 export class DoclingDocumentParser extends BaseDocumentParser {
     get apiKeyRequired(): boolean {
@@ -29,6 +39,10 @@ export class DoclingDocumentParser extends BaseDocumentParser {
         return process.env.DOCLING_URL || 'http://docling-serve:5001';
     }
 
+    public get timeoutMs(): number {
+        return Number(process.env.DOCLING_TIMEOUT_MS) || 60000;
+    }
+
     // Required by interface; this parser exposes a single fixed model.
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     async models(_options?: DocumentModelOptions): Promise<DocumentParserModel[]> {
@@ -39,7 +53,8 @@ export class DoclingDocumentParser extends BaseDocumentParser {
 
     async ocr(options: DocumentOCROptions): Promise<OCRParseResult> {
         const formData = new FormData();
-        formData.append('ocr_engine', 'easyocr');
+        // Use official v1 ocr_preset parameter rather than deprecated ocr_engine
+        formData.append('ocr_preset', 'auto');
         formData.append('pdf_backend', 'dlparse_v2');
         formData.append('from_formats', 'pdf');
         formData.append('from_formats', 'docx');
@@ -56,7 +71,7 @@ export class DoclingDocumentParser extends BaseDocumentParser {
         formData.append('do_ocr', 'true');
 
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 60000);
+        const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
 
         try {
             // Official Docling Serve v1.x API endpoint
@@ -72,10 +87,21 @@ export class DoclingDocumentParser extends BaseDocumentParser {
                 throw new Error(`Docling Serve API error (${response.status}): ${errorBody || response.statusText}`);
             }
 
-            const data = await response.json() as { document?: { json_content?: unknown } };
+            const data = await response.json() as DoclingV1Response;
+
+            // Handle status codes explicitly
+            if (data.status === 'failure' || data.status === 'skipped') {
+                const errMsg = data.errors && data.errors.length > 0 ? JSON.stringify(data.errors) : `Conversion status was '${data.status}'`;
+                throw new Error(`Docling conversion failed: ${errMsg}`);
+            }
+
             const {document} = data;
             if (!document || !document.json_content) {
-                throw new Error('Docling Serve v1 API response missing document.json_content');
+                throw new Error(`Docling Serve v1 API response missing document.json_content (status: ${data.status || 'unknown'})`);
+            }
+
+            if (data.status === 'partial_success') {
+                logger.warn('Docling Serve returned partial_success for OCR conversion', { errors: data.errors });
             }
 
             const convertedJsonContent = this.convertJsonContent(document.json_content);
@@ -87,7 +113,7 @@ export class DoclingDocumentParser extends BaseDocumentParser {
 
     async parse(options: DocumentParseOptions): Promise<DocumentParseResult> {
         const formData = new FormData();
-        formData.append('ocr_engine', 'easyocr');
+        formData.append('ocr_preset', 'auto');
         formData.append('pdf_backend', 'dlparse_v2');
         formData.append('from_formats', 'pdf');
         formData.append('from_formats', 'docx');
@@ -104,7 +130,7 @@ export class DoclingDocumentParser extends BaseDocumentParser {
         formData.append('do_ocr', 'true');
 
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 60000);
+        const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
 
         try {
             // Official Docling Serve v1.x API endpoint
@@ -120,10 +146,21 @@ export class DoclingDocumentParser extends BaseDocumentParser {
                 throw new Error(`Docling Serve API error (${response.status}): ${errorBody || response.statusText}`);
             }
 
-            const data = await response.json() as { document?: { md_content?: string } };
+            const data = await response.json() as DoclingV1Response;
+
+            // Handle status codes explicitly
+            if (data.status === 'failure' || data.status === 'skipped') {
+                const errMsg = data.errors && data.errors.length > 0 ? JSON.stringify(data.errors) : `Conversion status was '${data.status}'`;
+                throw new Error(`Docling conversion failed: ${errMsg}`);
+            }
+
             const {document} = data;
             if (!document || typeof document.md_content !== 'string') {
-                throw new Error('Docling Serve v1 API response missing document.md_content');
+                throw new Error(`Docling Serve v1 API response missing document.md_content (status: ${data.status || 'unknown'})`);
+            }
+
+            if (data.status === 'partial_success') {
+                logger.warn('Docling Serve returned partial_success for document parsing', { errors: data.errors });
             }
 
             return {document: {content: {markdown: document.md_content}}};

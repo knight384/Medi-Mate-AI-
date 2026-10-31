@@ -1,17 +1,18 @@
-import prisma, {Prisma} from "@/lib/prisma";
-import {NextRequest, NextResponse} from "next/server";
-import {parseHealthData} from "@/lib/health-data/parser/pdf";
-import crypto from "node:crypto";
-import {fileTypeFromBuffer} from "file-type";
-import sharp from 'sharp'
-import {auth} from "@/auth";
-import {put} from "@vercel/blob";
-import {currentDeploymentEnv} from "@/lib/current-deployment-env";
-import fs from 'fs';
+import prisma, { Prisma } from "@/lib/prisma";
+import { NextRequest, NextResponse } from "next/server";
+import { parseHealthData } from "@/lib/health-data/parser/pdf";
+import { auth } from "@/auth";
+import fsp from 'node:fs/promises';
+import path from 'node:path';
 import { logger } from '@/lib/logger';
 import { getErrorMessage, handleApiError, AppError } from '@/lib/errors';
 import { readBoundedJson } from '@/lib/security/request-boundary';
 import { validateStructuralBounds } from '@/lib/security/structural-boundary';
+import {
+    localStorageDriver,
+    generateStorageKey,
+} from '@/lib/storage';
+import { readBoundedMultipart } from '@/lib/storage/multipart-reader';
 
 export interface HealthData extends Prisma.HealthDataGetPayload<{
     select: {
@@ -45,19 +46,18 @@ export interface HealthDataCreateResponse extends HealthData {
     id: string;
 }
 
-export async function POST(
-    req: NextRequest
-) {
-    const session = await auth()
-    if (!session || !session.user) return NextResponse.json({error: 'Unauthorized'}, {status: 401})
+export async function POST(req: NextRequest) {
+    const session = await auth();
+    if (!session || !session.user || !session.user.id) {
+        return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
 
-    const contentType = req.headers.get('content-type')
+    const contentType = req.headers.get('content-type');
     if (!contentType) {
-        return NextResponse.json({error: 'Missing content-type header'}, {status: 400})
+        return NextResponse.json({ error: 'Missing content-type header' }, { status: 400 });
     }
 
     const MAX_JSON_BYTES = 2 * 1024 * 1024; // 2 MB
-    const MAX_UPLOAD_BYTES = 20 * 1024 * 1024; // 20 MB
 
     if (contentType.includes('application/json')) {
         let data: HealthDataCreateRequest;
@@ -70,175 +70,154 @@ export async function POST(
             });
         } catch (err) {
             if (err instanceof AppError) return handleApiError(err);
-            return NextResponse.json({error: 'Invalid request payload'}, {status: 400});
+            return NextResponse.json({ error: 'Invalid request payload' }, { status: 400 });
         }
         const healthData = await prisma.healthData.create({
-            data: {...data, authorId: session.user.id}
-        })
-        return NextResponse.json<HealthDataCreateResponse>(healthData)
-    } else {
-        const contentLengthHeader = req.headers.get('content-length');
-        if (contentLengthHeader) {
-            const contentLength = parseInt(contentLengthHeader, 10);
-            if (!Number.isNaN(contentLength) && contentLength > MAX_UPLOAD_BYTES) {
-                return NextResponse.json(
-                    {error: `File size exceeds maximum allowed limit of ${MAX_UPLOAD_BYTES} bytes`},
-                    {status: 413}
-                );
-            }
+            data: { ...data, authorId: session.user.id }
+        });
+        return NextResponse.json<HealthDataCreateResponse>(healthData);
+    }
+
+    if (contentType.includes('multipart/form-data')) {
+        if (process.env.NODE_ENV === 'production' && !process.env.MEDIMATE_STORAGE_DIR) {
+            logger.error('Document upload rejected: MEDIMATE_STORAGE_DIR is not configured in production');
+            return NextResponse.json(
+                { error: 'Persistent storage is not configured for production environment', code: 'STORAGE_NOT_CONFIGURED' },
+                { status: 503 }
+            );
         }
 
-        const formData = await req.formData()
-        const file = formData.get('file')
-        const id = formData.get('id')
-
-        // Vision Parser
-        const visionParser = formData.get('visionParser')
-        const visionParserModel = formData.get('visionParserModel')
-        const visionParserApiKey = formData.get('visionParserApiKey')
-        const visionParserApiUrl = formData.get('visionParserApiUrl')
-
-        // Document Parser
-        const documentParser = formData.get('documentParser')
-        const documentParserModel = formData.get('documentParserModel')
-        const documentParserApiKey = formData.get('documentParserApiKey')
-
-        let filePath: string | undefined
-        let fileType: string | undefined
-        let baseData: { fileName: string } | undefined = undefined
-
-        // Save files
-        if (file instanceof File) {
-            if (file.size > MAX_UPLOAD_BYTES) {
-                return NextResponse.json(
-                    {error: `File size exceeds maximum allowed limit of ${MAX_UPLOAD_BYTES} bytes`},
-                    {status: 413}
-                );
-            }
-            const fileBuffer = Buffer.from(await file.arrayBuffer())
-            const result = await fileTypeFromBuffer(fileBuffer)
-            if (!result) return NextResponse.json({error: 'Failed to determine file type'}, {status: 400})
-
-            // Get file hash
-            const hash = crypto.createHash('md5')
-            hash.update(fileBuffer)
-            const fileHash = hash.digest('hex')
-
-            const {mime} = result
-            if (mime.startsWith('image/')) {
-                const outputBuffer = await sharp(fileBuffer).png().toBuffer()
-                const filename = `${fileHash}.png`;
-                if (currentDeploymentEnv === 'local') {
-                    fs.writeFileSync(`./public/uploads/${filename}`, outputBuffer)
-                    filePath = `${process.env.NEXT_PUBLIC_URL}/api/static/uploads/${filename}`
-                } else {
-                    const blob = await put(`/uploads/${filename}`, outputBuffer, {
-                        access: 'public',
-                        contentType: 'image/png'
-                    })
-                    filePath = blob.downloadUrl
-                }
-                fileType = 'image/png'
-                baseData = {fileName: file.name}
-            } else {
-                if (currentDeploymentEnv === 'local') {
-                    const extension = file.name.split('.').pop()
-                    const filename = `${fileHash}.${extension}`;
-                    fs.writeFileSync(`./public/uploads/${filename}`, fileBuffer)
-                    filePath = `${process.env.NEXT_PUBLIC_URL}/api/static/uploads/${filename}`
-                } else {
-                    const extension = file.name.split('.').pop()
-                    const filename = `${fileHash}.${extension}`;
-                    const blob = await put(`/uploads/${filename}`, fileBuffer, {
-                        access: 'public',
-                        contentType: mime
-                    })
-                    filePath = blob.downloadUrl
-                }
-                fileType = mime
-                baseData = {fileName: file.name}
-            }
+        let multipartResult;
+        try {
+            multipartResult = await readBoundedMultipart(req);
+        } catch (err) {
+            if (err instanceof AppError) return handleApiError(err);
+            return NextResponse.json({ error: 'Failed to process multipart upload' }, { status: 400 });
         }
 
-        // Create parsing data
+        const { fields, file, cleanup } = multipartResult;
+        if (!file) {
+            await cleanup();
+            return NextResponse.json({ error: 'No file uploaded' }, { status: 400 });
+        }
+
+        const id = fields.id;
+        const visionParser = fields.visionParser;
+        const visionParserModel = fields.visionParserModel;
+        const visionParserApiKey = fields.visionParserApiKey;
+        const visionParserApiUrl = fields.visionParserApiUrl;
+
+        const documentParser = fields.documentParser;
+        const documentParserModel = fields.documentParserModel;
+        const documentParserApiKey = fields.documentParserApiKey;
+
+        const extension = path.extname(file.safeName) || '.bin';
+        const storageKey = generateStorageKey(session.user.id, extension);
+        const targetPath = localStorageDriver.resolveSecurePath(storageKey);
+
+        try {
+            await fsp.mkdir(path.dirname(targetPath), { recursive: true, mode: 0o700 });
+            if (await localStorageDriver.exists(storageKey)) {
+                await cleanup();
+                logger.error('Storage collision: file already exists', { storageKey });
+                return NextResponse.json({ error: 'Storage collision detected' }, { status: 409 });
+            }
+            await fsp.rename(file.tempPath, targetPath);
+        } catch (err) {
+            await cleanup();
+            logger.error('Failed to move upload to private storage', { error: (err as Error).message });
+            return NextResponse.json({ error: 'Failed to store document' }, { status: 500 });
+        }
+
+        const baseData = {
+            fileName: file.safeName,
+            originalName: file.originalFilename,
+            size: file.size,
+            sha256: file.sha256,
+        };
+
         let healthData;
         try {
             healthData = await prisma.healthData.create({
                 data: {
-                    id: id ? id as string : undefined,
+                    id: id ? (id as string) : undefined,
                     type: 'FILE',
                     status: 'PARSING',
-                    filePath: filePath,
-                    fileType: fileType,
-                    data: baseData ? {...baseData} : {},
+                    filePath: storageKey,
+                    fileType: file.detectedMime,
+                    data: { ...baseData },
                     authorId: session.user.id,
                 },
             });
 
-            // Process file
-            const {data, pages, ocrResults} = await parseHealthData({
-                file: filePath as string,
+            // Process file through private OCR pipeline
+            const { data, pages, ocrResults } = await parseHealthData({
+                file: storageKey,
                 visionParser: visionParser ? {
-                    parser: visionParser as string,
-                    model: visionParserModel as string,
-                    apiKey: visionParserApiKey as string,
-                    apiUrl: visionParserApiUrl ? visionParserApiUrl as string : undefined
+                    parser: visionParser,
+                    model: visionParserModel,
+                    apiKey: visionParserApiKey,
+                    apiUrl: visionParserApiUrl || undefined,
                 } : undefined,
                 documentParser: documentParser ? {
-                    parser: documentParser as string,
-                    model: documentParserModel as string,
-                    apiKey: documentParserApiKey as string
-                } : undefined
-            })
+                    parser: documentParser,
+                    model: documentParserModel,
+                    apiKey: documentParserApiKey,
+                } : undefined,
+            });
 
-            // Update health data with parsed data
             healthData = await prisma.healthData.update({
-                where: {id: healthData.id},
+                where: { id: healthData.id },
                 data: {
                     status: 'COMPLETED',
-                    metadata: JSON.parse(JSON.stringify({ocr: ocrResults[0], dataPerPage: pages[0]})),
-                    data: {...baseData, ...data[0]}
-                }
+                    metadata: JSON.parse(JSON.stringify({ ocr: ocrResults[0], dataPerPage: pages[0] })),
+                    data: { ...baseData, ...data[0] },
+                },
             });
+
             return NextResponse.json(healthData);
         } catch (error) {
             logger.error('Error processing health data file', { message: getErrorMessage(error) });
-            const parsingLogs: string[] = []
-            parsingLogs.push(`Error: ${getErrorMessage(error)}`);
-            // If there's an error, update the health data with error logs
+            const parsingLogs: string[] = [`Error: ${getErrorMessage(error)}`];
             if (healthData) {
                 healthData = await prisma.healthData.update({
-                    where: {id: healthData.id},
+                    where: { id: healthData.id },
                     data: {
                         status: 'COMPLETED',
-                        data: {...baseData, parsingLogs},
-                    }
+                        data: { ...baseData, parsingLogs },
+                    },
                 });
                 return NextResponse.json(healthData);
             }
-            return NextResponse.json({error: 'Failed to process file'}, {status: 500});
+            await localStorageDriver.delete(storageKey);
+            return NextResponse.json({ error: 'Failed to process file' }, { status: 500 });
         }
     }
+
+    return NextResponse.json({ error: 'Unsupported content-type' }, { status: 415 });
 }
 
 export async function GET() {
-    const session = await auth()
-    if (!session || !session.user) return NextResponse.json({error: 'Unauthorized'}, {status: 401})
+    const session = await auth();
+    if (!session || !session.user || !session.user.id) {
+        return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
 
     // Create personal info if it doesn't exist
-    const personalInfo = await prisma.healthData.findFirst({where: {authorId: session.user.id, type: 'PERSONAL_INFO'}})
+    const personalInfo = await prisma.healthData.findFirst({
+        where: { authorId: session.user.id, type: 'PERSONAL_INFO' },
+    });
     if (personalInfo === null) {
         await prisma.healthData.create({
-            data: {type: 'PERSONAL_INFO', authorId: session.user.id, data: {}}
-        })
+            data: { type: 'PERSONAL_INFO', authorId: session.user.id, data: {} },
+        });
     }
 
     const healthDataList = await prisma.healthData.findMany({
-        where: {authorId: session.user.id},
-        orderBy: {createdAt: 'asc'}
-    })
+        where: { authorId: session.user.id },
+        orderBy: { createdAt: 'asc' },
+    });
     return NextResponse.json<HealthDataListResponse>({
-        healthDataList: healthDataList
-    })
-
+        healthDataList,
+    });
 }

@@ -21,7 +21,7 @@ dist/
 # Uploads and User health documents
 public/uploads/*
 !public/uploads/.gitkeep
-storage/
+/storage/
 
 # Python artifacts
 __pycache__/

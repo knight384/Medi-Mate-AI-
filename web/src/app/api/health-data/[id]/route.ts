@@ -2,10 +2,12 @@ import { NextRequest, NextResponse } from 'next/server';
 import prisma, { Prisma } from '@/lib/prisma';
 import { HealthData } from '@/app/api/health-data/route';
 import { assertResourceOwner, requireAuth } from '@/lib/api/auth-helpers';
-import { handleApiError } from '@/lib/errors';
+import { handleApiError, NotFoundError } from '@/lib/errors';
 import { cacheService } from '@/lib/redis';
 import { readBoundedJson } from '@/lib/security/request-boundary';
 import { validateStructuralBounds } from '@/lib/security/structural-boundary';
+import { localStorageDriver, isValidStorageKey } from '@/lib/storage';
+import { logger } from '@/lib/logger';
 
 export interface HealthDataPatchRequest {
   data?: Prisma.InputJsonValue;
@@ -69,6 +71,9 @@ export async function GET(
     );
 
     assertResourceOwner(record.authorId, session.user.id);
+    if (record.status === 'DELETING') {
+      throw new NotFoundError('Health data record not found');
+    }
     return NextResponse.json<HealthDataGetResponse>({ healthData: toPublicHealthData(record) });
   } catch (error) {
     return handleApiError(error);
@@ -93,6 +98,9 @@ export async function PATCH(
 
     const existing = await prisma.healthData.findUniqueOrThrow({ where: { id } });
     assertResourceOwner(existing.authorId, session.user.id);
+    if (existing.status === 'DELETING') {
+      throw new NotFoundError('Health data record not found');
+    }
 
     const healthData = await prisma.healthData.update({
       where: { id },
@@ -117,9 +125,31 @@ export async function DELETE(
     const existing = await prisma.healthData.findUniqueOrThrow({ where: { id } });
     assertResourceOwner(existing.authorId, session.user.id);
 
+    // 1. Mark status as DELETING in DB so concurrent access fails closed and state is recoverable
+    if (existing.status !== 'DELETING') {
+      await prisma.healthData.update({
+        where: { id },
+        data: { status: 'DELETING' },
+      });
+    }
+
+    // 2. Idempotent physical file deletion
+    if (existing.filePath && isValidStorageKey(existing.filePath)) {
+      try {
+        await localStorageDriver.delete(existing.filePath);
+      } catch (storageErr) {
+        logger.error('Failed to remove storage document during deletion', {
+          id,
+          error: (storageErr as Error).message,
+        });
+        throw storageErr; // Ensure failure halts DB deletion so retry can clean up
+      }
+    }
+
+    // 3. Finalize database deletion and purge cache
     await prisma.healthData.delete({ where: { id } });
     await cacheService.delete(`health-data:${id}`);
-    return NextResponse.json({});
+    return NextResponse.json({ success: true });
   } catch (error) {
     return handleApiError(error);
   }

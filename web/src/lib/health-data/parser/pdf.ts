@@ -1,19 +1,22 @@
 /* eslint-disable */
 
 import {ChatPromptTemplate} from "@langchain/core/prompts";
-import {HealthCheckupSchema, HealthCheckupType} from "@/lib/health-data/parser/schema";
+import {HealthCheckupSchema} from "@/lib/health-data/parser/schema";
 import {parseWithBounds} from "@/lib/security/structural-boundary";
 import {fileTypeFromBuffer} from 'file-type';
-import {getFileMd5, processBatchWithConcurrency} from "@/lib/health-data/parser/util";
+import {processBatchWithConcurrency} from "@/lib/health-data/parser/util";
 import {getParsePrompt, MessagePayload} from "@/lib/health-data/parser/prompt";
 import visions from "@/lib/health-data/parser/vision";
 import documents from "@/lib/health-data/parser/document";
-import {put} from "@vercel/blob";
 import {currentDeploymentEnv} from "@/lib/current-deployment-env";
 import fs from "node:fs";
-import {fromBuffer as pdf2picFromBuffer} from 'pdf2pic'
+import fsp from "node:fs/promises";
+import path from "node:path";
+import crypto from "node:crypto";
+import {fromBuffer as pdf2picFromBuffer} from 'pdf2pic';
 import {tasks} from "@trigger.dev/sdk/v3";
 import type {pdfToImages} from "@/trigger/pdf-to-image";
+import {localStorageDriver, isValidStorageKey} from "@/lib/storage";
 
 interface VisionParserOptions {
     parser: string;
@@ -42,7 +45,22 @@ interface InferenceOptions {
     documentParser: DocumentParserOptions
 }
 
+async function loadFileBuffer(filePath: string): Promise<Buffer> {
+    if (isValidStorageKey(filePath)) {
+        const diskPath = await localStorageDriver.getValidatedDiskPath(filePath);
+        return await fsp.readFile(diskPath);
+    }
+    if (path.isAbsolute(filePath) && fs.existsSync(filePath)) {
+        return await fsp.readFile(filePath);
+    }
+    throw new Error(`Unauthorized or invalid document path: ${filePath}`);
+}
+
 async function documentOCR({document, documentParser}: { document: string, documentParser: DocumentParserOptions }) {
+    let resolvedDoc = document;
+    if (isValidStorageKey(document)) {
+        resolvedDoc = await localStorageDriver.getValidatedDiskPath(document);
+    }
 
     // Get the document parser
     const parser = documents.find(e => e.name === documentParser.parser)
@@ -54,7 +72,7 @@ async function documentOCR({document, documentParser}: { document: string, docum
     if (!model) throw new Error('Invalid document parser model')
 
     // Get the ocr result
-    const {ocr} = await parser.ocr({input: document, model: model, apiKey: documentParser.apiKey})
+    const {ocr} = await parser.ocr({input: resolvedDoc, model: model, apiKey: documentParser.apiKey})
 
     return ocr
 }
@@ -102,10 +120,16 @@ async function inference(inferenceOptions: InferenceOptions) {
     // Extract image data if not excluding images
     const imageDataList: string[] = !excludeImage ? await processBatchWithConcurrency(
         imagePaths,
-        async (path) => {
-            const fileResponse = await fetch(path)
-            const buffer = Buffer.from(await fileResponse.arrayBuffer())
-            return `data:image/png;base64,${buffer.toString('base64')}`
+        async (itemPath) => {
+            if (itemPath.startsWith('data:')) {
+                return itemPath;
+            }
+            try {
+                const buffer = await fsp.readFile(itemPath);
+                return `data:image/png;base64,${buffer.toString('base64')}`;
+            } catch (readErr) {
+                throw new Error(`Failed to read page image artifact: ${itemPath}`);
+            }
         },
         4
     ) : []
@@ -141,53 +165,24 @@ async function inference(inferenceOptions: InferenceOptions) {
             apiKey: visionParserOptions.apiKey,
             apiUrl: visionParserOptions.apiUrl,
         }),
-        4
+        3
     )
 
-    // Merge the results
-    const data: { [key: string]: HealthCheckupType } = batchData.reduce((acc, curr, i) => {
-        acc[`page_${i}`] = curr;
-        return acc;
-    }, {} as { [key: string]: HealthCheckupType });
+    // Merge the data into a single object
+    let mergeData: any = {}
+    let mergedTestResult: { [key: string]: any } = {}
+    let mergedTestResultPage: { [key: string]: { page: number } } = {}
 
-    // Merge Results
-    const mergeInfo: { [key: string]: { pages: number[], values: any[] } } = {}
-
-    for (const key of HealthCheckupSchema.shape.test_result.keyof().options) {
-        const testFields = [];
-        const testPages: number[] = [];
-        for (let i = 0; i < numPages; i++) {
-            const healthCheckup = data[`page_${i}`]
-            const healthCheckupTestResult = healthCheckup.test_result
-
-            if (healthCheckupTestResult.hasOwnProperty(key) && healthCheckupTestResult[key]) {
-                testFields.push(healthCheckupTestResult[key])
-                testPages.push(i)
+    for (let page = 0; page < batchData.length; page++) {
+        const {test_result: testResult, ...healthCheckup} = batchData[page]
+        for (const [key, value] of Object.entries(testResult)) {
+            if (value && (value as { value: string }).value) {
+                mergedTestResult[key] = value
+                mergedTestResultPage[key] = {page: page + 1}
             }
         }
 
-        if (testFields.length > 0) {
-            mergeInfo[key] = {'pages': testPages, 'values': testFields}
-        }
-    }
-
-    const mergedTestResult: { [key: string]: any } = {}
-    const mergedTestResultPage: { [key: string]: { page: number } } = {}
-
-    // Merge the results
-    for (const mergeInfoKey in mergeInfo) {
-        const mergeTarget = mergeInfo[mergeInfoKey]
-        mergedTestResult[mergeInfoKey] = mergeTarget.values[0]
-        mergedTestResultPage[mergeInfoKey] = {
-            page: mergeTarget.pages[0] + 1
-        }
-    }
-
-    let mergeData: any = {}
-
-    // Merge name and date
-    for (let i = 0; i < numPages; i++) {
-        const healthCheckup = data[`page_${i}`]
+        // Merge health checkup data
         mergeData = {
             ...mergeData,
             ...healthCheckup,
@@ -211,68 +206,56 @@ async function inference(inferenceOptions: InferenceOptions) {
 
 /**
  * Convert a document to images
- * - pdf: convert to images
- * - image: nothing
- *
- * @param file
- *
- * @returns {Promise<string[]>} - List of image paths
+ * - Uses in-memory base64 buffers
+ * - Writes temporary page images to private storage temp directory outside web/public/
+ * - Returns paths and temp directory for lifecycle cleanup
  */
-async function documentToImages({file: filePath}: Pick<SourceParseOptions, 'file'>): Promise<string[]> {
-    const fileResponse = await fetch(filePath);
-    const fileBuffer = Buffer.from(await fileResponse.arrayBuffer())
-    const result = await fileTypeFromBuffer(fileBuffer)
-    const fileHash = await getFileMd5(fileBuffer)
-    if (!result) throw new Error('Invalid file type')
-    const mime = result.mime
+async function documentToImages({file: filePath}: Pick<SourceParseOptions, 'file'>): Promise<{ imagePaths: string[]; tempDir: string }> {
+    const fileBuffer = await loadFileBuffer(filePath);
+    const result = await fileTypeFromBuffer(fileBuffer);
+    if (!result) throw new Error('Invalid file type');
+    const mime = result.mime;
 
     // Convert pdf to images, or use the image as is
-    const images: string[] = []
+    const images: string[] = [];
     if (mime === 'application/pdf') {
         if (currentDeploymentEnv === 'local') {
-            const pdf2picConverter = pdf2picFromBuffer(fileBuffer, {preserveAspectRatio: true})
+            const pdf2picConverter = pdf2picFromBuffer(fileBuffer, {preserveAspectRatio: true});
             for (const image of await pdf2picConverter.bulk(-1, {responseType: 'base64'})) {
-                if (image.base64) images.push(`data:image/png;base64,${image.base64}`)
+                if (image.base64) images.push(`data:image/png;base64,${image.base64}`);
             }
         } else {
             const result = await tasks.triggerAndPoll<typeof pdfToImages>(
                 'pdf-to-image',
                 {pdfUrl: filePath},
                 {pollIntervalMs: 5000},
-            )
+            );
             if (result.status === 'COMPLETED' && result.output) {
-                images.push(...result.output.images.map((image) => `data:image/png;base64,${image}`))
+                images.push(...result.output.images.map((image) => `data:image/png;base64,${image}`));
             } else {
-                throw new Error('Failed to convert the pdf to images')
+                throw new Error('Failed to convert the pdf to images');
             }
         }
     } else {
-        images.push(`data:${mime};base64,${fileBuffer.toString('base64')}`)
+        images.push(`data:${mime};base64,${fileBuffer.toString('base64')}`);
     }
 
-    // Write the image data to a file
-    const imagePaths = []
+    // Write image data to a private temporary directory outside web/public/
+    const tempDir = path.join(localStorageDriver.getStorageRoot(), '.tmp', `ocr_${crypto.randomUUID()}`);
+    await fsp.mkdir(tempDir, { recursive: true, mode: 0o700 });
+
+    const imagePaths: string[] = [];
     for (let i = 0; i < images.length; i++) {
-        if (currentDeploymentEnv === 'local') {
-            fs.writeFileSync(`./public/uploads/${fileHash}_${i}.png`, Buffer.from(images[i].split(',')[1], 'base64'))
-            imagePaths.push(`${process.env.NEXT_PUBLIC_URL}/api/static/uploads/${fileHash}_${i}.png`)
-        } else {
-            const blob = await put(
-                `/uploads/${fileHash}_${i}.png`,
-                Buffer.from(images[i].split(',')[1], 'base64'),
-                {access: 'public', contentType: 'image/png'}
-            )
-            imagePaths.push(blob.downloadUrl)
-        }
+        const pagePath = path.join(tempDir, `page_${i}.png`);
+        await fsp.writeFile(pagePath, Buffer.from(images[i].split(',')[1], 'base64'));
+        imagePaths.push(pagePath);
     }
 
-    return imagePaths
+    return { imagePaths, tempDir };
 }
 
 /**
- * Parse the health data
- *
- * @param options
+ * Parse the health data with guaranteed temporary file cleanup
  */
 export async function parseHealthData(options: SourceParseOptions) {
     const {file: filePath} = options
@@ -291,101 +274,112 @@ export async function parseHealthData(options: SourceParseOptions) {
         apiKey: process.env.UPSTAGE_API_KEY as string
     }
 
-    // prepare images
-    const imagePaths = await documentToImages({file: filePath})
+    // Prepare images and track temporary directory
+    const { imagePaths, tempDir } = await documentToImages({file: filePath});
 
-    // prepare ocr results
-    const ocrResults = await documentOCR({
-        document: filePath,
-        documentParser: documentParser
-    })
+    try {
+        // Prepare ocr results
+        const ocrResults = await documentOCR({
+            document: filePath,
+            documentParser: documentParser
+        });
 
-    // prepare parse results
-    await processBatchWithConcurrency(
-        imagePaths,
-        async (path) => documentParse({document: path, documentParser: documentParser}),
-        3
-    )
+        // Prepare parse results
+        await processBatchWithConcurrency(
+            imagePaths,
+            async (path) => documentParse({document: path, documentParser: documentParser}),
+            3
+        );
 
-    // Merge the results
-    const baseInferenceOptions = {imagePaths, visionParser, documentParser}
-    const [
-        {finalHealthCheckup: resultTotal, mergedTestResultPage: resultTotalPages},
-        {finalHealthCheckup: resultText, mergedTestResultPage: resultTextPages},
-        {finalHealthCheckup: resultImage, mergedTestResultPage: resultImagePages}
-    ] = await Promise.all([
-        inference({...baseInferenceOptions, excludeImage: false, excludeText: false}),
-        inference({...baseInferenceOptions, excludeImage: false, excludeText: true}),
-        inference({...baseInferenceOptions, excludeImage: true, excludeText: false}),
-    ]);
+        // Merge the results
+        const baseInferenceOptions = {imagePaths, visionParser, documentParser}
+        const [
+            {finalHealthCheckup: resultTotal, mergedTestResultPage: resultTotalPages},
+            {finalHealthCheckup: resultText, mergedTestResultPage: resultTextPages},
+            {finalHealthCheckup: resultImage, mergedTestResultPage: resultImagePages}
+        ] = await Promise.all([
+            inference({...baseInferenceOptions, excludeImage: false, excludeText: false}),
+            inference({...baseInferenceOptions, excludeImage: false, excludeText: true}),
+            inference({...baseInferenceOptions, excludeImage: true, excludeText: false}),
+        ]);
 
-    const resultDictTotal = resultTotal.test_result
-    const resultDictText = resultText.test_result
-    const resultDictImage = resultImage.test_result
+        const resultDictTotal = resultTotal.test_result
+        const resultDictText = resultText.test_result
+        const resultDictImage = resultImage.test_result
 
-    const mergedTestResult: { [key: string]: any } = {}
-    const mergedPageResult: { [key: string]: { page: number } | null } = {}
+        const mergedTestResult: { [key: string]: any } = {}
+        const mergedPageResult: { [key: string]: { page: number } | null } = {}
 
-    for (const key of HealthCheckupSchema.shape.test_result.keyof().options) {
-        const valueTotal =
-            resultDictTotal.hasOwnProperty(key) &&
-            resultDictTotal[key] !== null &&
-            resultDictTotal[key]!.value !== null
-                ? resultDictTotal[key]
-                : null;
-        const pageTotal = valueTotal !== null ? resultTotalPages[key] : null;
+        for (const key of HealthCheckupSchema.shape.test_result.keyof().options) {
+            const valueTotal =
+                resultDictTotal.hasOwnProperty(key) &&
+                resultDictTotal[key] !== null &&
+                resultDictTotal[key]!.value !== null
+                    ? resultDictTotal[key]
+                    : null;
+            const pageTotal = valueTotal !== null ? resultTotalPages[key] : null;
 
-        const valueText =
-            resultDictText.hasOwnProperty(key) &&
-            resultDictText[key] !== null &&
-            resultDictText[key]!.value !== null
-                ? resultDictText[key]
-                : null;
-        const pageText = valueText !== null ? resultTextPages[key] : null;
+            const valueText =
+                resultDictText.hasOwnProperty(key) &&
+                resultDictText[key] !== null &&
+                resultDictText[key]!.value !== null
+                    ? resultDictText[key]
+                    : null;
+            const pageText = valueText !== null ? resultTextPages[key] : null;
 
-        const valueImage =
-            resultDictImage.hasOwnProperty(key) &&
-            resultDictImage[key] !== null &&
-            resultDictImage[key]!.value !== null
-                ? resultDictImage[key]
-                : null;
-        const pageImage = valueImage !== null ? resultImagePages[key] : null;
+            const valueImage =
+                resultDictImage.hasOwnProperty(key) &&
+                resultDictImage[key] !== null &&
+                resultDictImage[key]!.value !== null
+                    ? resultDictImage[key]
+                    : null;
+            const pageImage = valueImage !== null ? resultImagePages[key] : null;
 
-        if (valueTotal === null) {
-            if (valueText !== null) {
-                mergedTestResult[key] = valueText;
-                mergedPageResult[key] = pageText;
-            } else if (valueImage !== null) {
-                mergedTestResult[key] = valueImage;
-                mergedPageResult[key] = pageImage;
+            if (valueTotal === null) {
+                if (valueText !== null) {
+                    mergedTestResult[key] = valueText;
+                    mergedPageResult[key] = pageText;
+                } else if (valueImage !== null) {
+                    mergedTestResult[key] = valueImage;
+                    mergedPageResult[key] = pageImage;
+                } else {
+                    mergedTestResult[key] = valueText;
+                    mergedPageResult[key] = pageText;
+                }
             } else {
-                mergedTestResult[key] = valueText;
-                mergedPageResult[key] = pageText;
+                mergedTestResult[key] = valueTotal;
+                mergedPageResult[key] = pageTotal;
             }
-        } else {
-            mergedTestResult[key] = valueTotal;
-            mergedPageResult[key] = pageTotal;
+        }
+
+        // Remove all null values in mergedTestResult
+        for (const key in mergedTestResult) {
+            if (mergedTestResult[key] === null) {
+                delete mergedTestResult[key]
+            }
+        }
+
+        const healthCheckup = parseWithBounds(
+            HealthCheckupSchema,
+            {
+                ...resultTotal,
+                test_result: mergedTestResult
+            },
+            {
+                maxDepth: 5,
+                maxKeys: 500,
+            }
+        )
+
+        return {data: [healthCheckup], pages: [mergedPageResult], ocrResults: [ocrResults]}
+    } finally {
+        // Guaranteed cleanup of temporary page images outside web/public/
+        if (tempDir) {
+            try {
+                await fsp.rm(tempDir, { recursive: true, force: true });
+            } catch {
+                // Ignore cleanup error if already removed
+            }
         }
     }
-
-    // remove all null values in mergedTestResult
-    for (const key in mergedTestResult) {
-        if (mergedTestResult[key] === null) {
-            delete mergedTestResult[key]
-        }
-    }
-
-    const healthCheckup = parseWithBounds(
-        HealthCheckupSchema,
-        {
-            ...resultTotal,
-            test_result: mergedTestResult
-        },
-        {
-            maxDepth: 5,
-            maxKeys: 500,
-        }
-    )
-
-    return {data: [healthCheckup], pages: [mergedPageResult], ocrResults: [ocrResults]}
 }

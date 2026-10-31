@@ -37,11 +37,16 @@ export async function processBatchWithConcurrency<T, R>(
     return results;
 }
 
+import { localStorageDriver, isValidStorageKey } from '@/lib/storage';
+
 /**
- * Resolve the upload path
+ * Resolve the upload path using private storage driver.
  *
- * @param path
+ * @param storageKey
  */
-export async function resolveUploadPath(path: string): Promise<string> {
-    return `./public/uploads/${path}`
+export async function resolveUploadPath(storageKey: string): Promise<string> {
+    if (isValidStorageKey(storageKey)) {
+        return localStorageDriver.resolveSecurePath(storageKey);
+    }
+    throw new Error('Direct public upload paths are decommissioned. Use private storage keys.');
 }

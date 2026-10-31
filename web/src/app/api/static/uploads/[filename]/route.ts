@@ -1,24 +1,22 @@
-import {NextRequest} from "next/server";
-import fs from "fs/promises";
+import { NextResponse } from 'next/server';
 
-export async function GET(
-    _req: NextRequest,
-    {params}: { params: Promise<{ filename: string }> }
-) {
-    const {filename} = await params
-
-    if (!filename.match(/^[a-zA-Z0-9-_]+\.(pdf|png)$/)) {
-        return new Response('Invalid filename', {status: 400})
+/**
+ * DECOMMISSIONED: Public document access is permanently disabled for patient data security.
+ * All medical document downloads must go through the authenticated endpoint:
+ * GET /api/health-data/[id]/file
+ */
+export async function GET() {
+  return NextResponse.json(
+    {
+      error: 'Public file access is decommissioned. Authenticate and retrieve documents via /api/health-data/[id]/file',
+      code: 'PUBLIC_ACCESS_DECOMMISSIONED',
+    },
+    {
+      status: 404,
+      headers: {
+        'Cache-Control': 'no-store, max-age=0',
+        'X-Content-Type-Options': 'nosniff',
+      },
     }
-
-    const filePath = `./public/uploads/${filename}`
-    const file = await fs.readFile(filePath)
-
-    // Response blob
-    return new Response(file, {
-        headers: {
-            'Content-Type': 'application/octet-stream',
-            'Content-Disposition': `attachment; filename=${filename}`
-        }
-    })
+  );
 }

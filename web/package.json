@@ -8,7 +8,7 @@
     "start": "next start",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "vitest run --no-file-parallelism",
     "test:watch": "vitest",
     "validate": "npm run typecheck && npm run lint && npm run test",
     "deploy:trigger-prod": "npx trigger.dev@3.3.16 deploy"
@@ -19,6 +19,7 @@
   "dependencies": {
     "@amplitude/analytics-browser": "^2.11.12",
     "@anthropic-ai/sdk": "^0.36.3",
+    "@fastify/busboy": "^3.2.4",
     "@google/generative-ai": "^0.21.0",
     "@langchain/anthropic": "^0.3.13",
     "@langchain/core": "^0.3.39",

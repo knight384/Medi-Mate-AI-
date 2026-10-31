@@ -13,6 +13,61 @@ import fs from 'node:fs'
 import {currentDeploymentEnv} from "@/lib/current-deployment-env";
 import {logger} from "@/lib/logger";
 
+/**
+ * Docling Serve v1 Asynchronous API Lifecycle:
+ *
+ * For long-running or batch conversions of complex multi-page clinical records,
+ * Docling Serve v1 exposes an official asynchronous task processing workflow:
+ *
+ * 1. Dispatch Asynchronous Conversion:
+ *    POST /v1/convert/file/async
+ *    - Consumes multipart/form-data identical to /v1/convert/file
+ *    - Returns HTTP 200 with JSON payload: { "task_id": string }
+ *
+ * 2. Status Polling:
+ *    GET /v1/status/poll/{task_id}
+ *    - Returns current task execution status:
+ *      { "task_id": string, "status": "PENDING" | "STARTED" | "SUCCESS" | "FAILURE" }
+ *    - Caller polls this endpoint using exponential backoff until a terminal state is reached.
+ *    - NOTE: Do NOT use legacy non-standard paths like /v1/convert/tasks/{task_id}.
+ *
+ * 3. Retrieve Conversion Artifacts:
+ *    GET /v1/result/{task_id}
+ *    - Once /v1/status/poll/{task_id} reports "SUCCESS", this endpoint retrieves
+ *      the completed document payload (markdown, json_content, or exported tables).
+ */
+export interface DoclingAsyncTaskResponse {
+    task_id: string;
+}
+
+export type DoclingPollTaskStatus = 'PENDING' | 'STARTED' | 'SUCCESS' | 'FAILURE';
+
+export interface DoclingTaskStatusResponse {
+    task_id: string;
+    status: DoclingPollTaskStatus;
+    error?: string;
+}
+
+export type DoclingConversionStatus = 'SUCCESS' | 'PARTIAL' | 'FAILED' | 'SKIPPED';
+
+export interface DoclingCompletenessMetadata {
+    status: DoclingConversionStatus;
+    isIncomplete: boolean;
+    errors?: unknown[];
+}
+
+export interface DoclingOCRParseResult extends OCRParseResult, DoclingCompletenessMetadata {
+    ocr: unknown;
+}
+
+export interface DoclingDocumentParseResult extends DocumentParseResult, DoclingCompletenessMetadata {
+    document: {
+        content: {
+            markdown: string;
+        };
+    };
+}
+
 interface DoclingV1Response {
     status?: 'success' | 'partial_success' | 'skipped' | 'failure';
     errors?: unknown[];
@@ -51,7 +106,7 @@ export class DoclingDocumentParser extends BaseDocumentParser {
         ];
     }
 
-    async ocr(options: DocumentOCROptions): Promise<OCRParseResult> {
+    async ocr(options: DocumentOCROptions): Promise<DoclingOCRParseResult> {
         const formData = new FormData();
         // Use official v1 ocr_preset parameter rather than deprecated ocr_engine
         formData.append('ocr_preset', 'auto');
@@ -100,18 +155,26 @@ export class DoclingDocumentParser extends BaseDocumentParser {
                 throw new Error(`Docling Serve v1 API response missing document.json_content (status: ${data.status || 'unknown'})`);
             }
 
-            if (data.status === 'partial_success') {
-                logger.warn('Docling Serve returned partial_success for OCR conversion', { errors: data.errors });
+            const isPartial = data.status === 'partial_success';
+            if (isPartial) {
+                logger.warn('Docling Serve returned partial_success for OCR conversion', {
+                    errorCount: data.errors?.length ?? 0
+                });
             }
 
             const convertedJsonContent = this.convertJsonContent(document.json_content);
-            return {ocr: convertedJsonContent};
+            return {
+                ocr: convertedJsonContent,
+                status: isPartial ? 'PARTIAL' : 'SUCCESS',
+                isIncomplete: isPartial,
+                errors: data.errors,
+            };
         } finally {
             clearTimeout(timeoutId);
         }
     }
 
-    async parse(options: DocumentParseOptions): Promise<DocumentParseResult> {
+    async parse(options: DocumentParseOptions): Promise<DoclingDocumentParseResult> {
         const formData = new FormData();
         formData.append('ocr_preset', 'auto');
         formData.append('pdf_backend', 'dlparse_v2');
@@ -159,11 +222,19 @@ export class DoclingDocumentParser extends BaseDocumentParser {
                 throw new Error(`Docling Serve v1 API response missing document.md_content (status: ${data.status || 'unknown'})`);
             }
 
-            if (data.status === 'partial_success') {
-                logger.warn('Docling Serve returned partial_success for document parsing', { errors: data.errors });
+            const isPartial = data.status === 'partial_success';
+            if (isPartial) {
+                logger.warn('Docling Serve returned partial_success for document parsing', {
+                    errorCount: data.errors?.length ?? 0
+                });
             }
 
-            return {document: {content: {markdown: document.md_content}}};
+            return {
+                document: {content: {markdown: document.md_content}},
+                status: isPartial ? 'PARTIAL' : 'SUCCESS',
+                isIncomplete: isPartial,
+                errors: data.errors,
+            };
         } finally {
             clearTimeout(timeoutId);
         }

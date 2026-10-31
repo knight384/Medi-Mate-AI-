@@ -179,10 +179,12 @@ describe('Docling Document Parser — v1.x API Contract & Error Handling (10 Sce
     const parser = new DoclingDocumentParser();
     const res = await parser.parse({ input: testPdfPath, model: mockModel });
     expect((res.document as { content: { markdown: string } }).content.markdown).toBe('Normal ECG');
+    expect(res.status).toBe('SUCCESS');
+    expect(res.isIncomplete).toBe(false);
   });
 
   // Scenario 6: Partial-success response handling
-  it('Scenario 6: gracefully processes status "partial_success" when content is present', async () => {
+  it('Scenario 6: gracefully processes status "partial_success" when content is present and marks isIncomplete', async () => {
     (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
       status: 200,
@@ -196,6 +198,9 @@ describe('Docling Document Parser — v1.x API Contract & Error Handling (10 Sce
     const parser = new DoclingDocumentParser();
     const res = await parser.parse({ input: testPdfPath, model: mockModel });
     expect((res.document as { content: { markdown: string } }).content.markdown).toBe('Extracted text with warning');
+    expect(res.status).toBe('PARTIAL');
+    expect(res.isIncomplete).toBe(true);
+    expect(res.errors).toEqual([{ message: 'Minor font embedding warning' }]);
   });
 
   // Scenario 7: Failed conversion response handling
@@ -275,5 +280,29 @@ describe('Docling Document Parser — v1.x API Contract & Error Handling (10 Sce
         model: mockModel,
       })
     ).rejects.toThrow('aborted');
+  });
+
+  // Scenario 11: OCR partial-success handling
+  it('Scenario 11: marks OCR conversion as PARTIAL with isIncomplete=true when Docling returns partial_success', async () => {
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        status: 'partial_success',
+        errors: [{ message: 'Low confidence on page 2 table' }],
+        document: {
+          json_content: {
+            pages: { '1': { size: { width: 100, height: 200 } } },
+            texts: [{ text: 'Clinical Summary', prov: [{ page_no: 1, bbox: { l: 10, t: 50, r: 90, b: 20 } }] }],
+          },
+        },
+      }),
+    });
+
+    const parser = new DoclingDocumentParser();
+    const res = await parser.ocr({ input: testPdfPath, model: mockModel });
+    expect(res.status).toBe('PARTIAL');
+    expect(res.isIncomplete).toBe(true);
+    expect(res.errors).toEqual([{ message: 'Low confidence on page 2 table' }]);
   });
 });

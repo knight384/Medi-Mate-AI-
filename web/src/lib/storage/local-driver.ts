@@ -164,6 +164,14 @@ export class LocalStorageDriver {
         throw new StorageSecurityError('Uploaded object is not a regular file');
       }
 
+      // Explicitly flush file data and directory metadata to durable storage prior to publication
+      const fileHandle = await fsp.open(tempFilePath, 'r+');
+      try {
+        await fileHandle.sync();
+      } finally {
+        await fileHandle.close();
+      }
+
       // Atomically publish the temporary file exclusively (create-if-absent)
       // Hard linking ensures that if targetPath already exists, publication fails atomically with EEXIST rather than overwriting
       try {

@@ -5,6 +5,7 @@ const deploymentEnvSchema = z.enum(['local', 'cloud']);
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   DATABASE_URL: z.string().min(1).optional(),
+  MIGRATION_DATABASE_URL: z.string().min(1).optional(),
   AUTH_SECRET: z.string().min(1).optional(),
   AUTH_TRUST_HOST: z.string().optional(),
   ENCRYPTION_KEY: z.string().optional(),

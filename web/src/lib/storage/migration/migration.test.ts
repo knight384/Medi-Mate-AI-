@@ -8,7 +8,7 @@ import { Readable } from 'node:stream';
 import { LocalStorageDriver } from '../local-driver';
 import { LegacyMigrationWorkflow } from './migration-workflow';
 import { HealthDataRecord, MigrationDatabaseAdapter, MigrationMetadata } from './types';
-import { isValidStorageKey } from '../naming';
+import { isValidStorageKey, generateStorageKey } from '../naming';
 
 describe('Legacy Document Migration Workflow & Synthetic Dry-Run', () => {
   let testRootDir: string;
@@ -430,6 +430,359 @@ describe('Legacy Document Migration Workflow & Synthetic Dry-Run', () => {
       expect(result2.status).toBe('SUCCESS');
       expect(result2.newStorageKey).toBe(result1.newStorageKey);
       expect(dbCalls).toBe(2);
+    });
+  });
+
+  describe('Task D: Adversarial Concurrency & Crash Recovery (10 Synthetic Scenarios)', () => {
+    // 1. Two workers process the same record simultaneously
+    it('Scenario 1: allows two workers processing the same record simultaneously to converge safely', async () => {
+      const content = Buffer.from('%PDF-1.4 Concurrent Test Document Content');
+      const filename = 'concurrent_same_record.pdf';
+      await fsp.writeFile(path.join(testLegacyUploadsDir, filename), content);
+
+      const record: HealthDataRecord = {
+        id: 'rec_concurrent_01',
+        authorId: testUserId,
+        filePath: `/uploads/${filename}`,
+        fileType: 'application/pdf',
+        status: 'COMPLETED',
+      };
+
+      const worker1 = new LegacyMigrationWorkflow(storageDriver, {
+        legacyUploadsDir: testLegacyUploadsDir,
+        dryRun: false,
+      });
+      const worker2 = new LegacyMigrationWorkflow(storageDriver, {
+        legacyUploadsDir: testLegacyUploadsDir,
+        dryRun: false,
+      });
+
+      const [res1, res2] = await Promise.all([
+        worker1.migrateRecord(record, testUserId),
+        worker2.migrateRecord(record, testUserId),
+      ]);
+
+      expect(res1.status).toBe('SUCCESS');
+      expect(res2.status).toBe('SUCCESS');
+      expect(res1.newStorageKey).toBe(res2.newStorageKey);
+      expect(await storageDriver.exists(res1.newStorageKey!)).toBe(true);
+
+      const streamRes = await storageDriver.readStream(res1.newStorageKey!);
+      const chunks: Buffer[] = [];
+      for await (const chunk of streamRes.stream) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      }
+      expect(Buffer.concat(chunks).toString()).toBe(content.toString());
+    });
+
+    // 2. Two workers derive the same destination key
+    it('Scenario 2: confirms two workers derive the exact same destination key matching UUID format', () => {
+      const recordId = 'rec_deterministic_key_02';
+      const key1 = generateStorageKey(testUserId, 'pdf', recordId);
+      const key2 = generateStorageKey(testUserId, 'pdf', recordId);
+
+      expect(key1).toBe(key2);
+      expect(isValidStorageKey(key1)).toBe(true);
+      expect(key1).toMatch(/^users\/patient_auth_user_101\/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-a[0-9a-f]{3}-[0-9a-f]{12}\.pdf$/);
+    });
+
+    // 3. Both workers attempt to write to the same destination
+    it('Scenario 3: ensures both workers attempting to write to the same destination leave complete, uncorrupted content', async () => {
+      const content = Buffer.from('%PDF-1.4 Identical Content for Write Race Verification');
+      const filename = 'write_race.pdf';
+      await fsp.writeFile(path.join(testLegacyUploadsDir, filename), content);
+
+      const record: HealthDataRecord = {
+        id: 'rec_write_race_03',
+        authorId: testUserId,
+        filePath: `/uploads/${filename}`,
+        fileType: 'application/pdf',
+        status: 'COMPLETED',
+      };
+
+      const workerA = new LegacyMigrationWorkflow(storageDriver, {
+        legacyUploadsDir: testLegacyUploadsDir,
+        dryRun: false,
+      });
+      const workerB = new LegacyMigrationWorkflow(storageDriver, {
+        legacyUploadsDir: testLegacyUploadsDir,
+        dryRun: false,
+      });
+
+      const results = await Promise.all([
+        workerA.migrateRecord(record, testUserId),
+        workerB.migrateRecord(record, testUserId),
+      ]);
+
+      for (const res of results) {
+        expect(res.status).toBe('SUCCESS');
+        expect(res.sourceSha256).toBe(res.destinationSha256);
+      }
+    });
+
+    // 4. One worker completes the file write before the other begins reconciliation
+    it('Scenario 4: reconciles successfully when one worker completes file write prior to second worker starting', async () => {
+      const content = Buffer.from('%PDF-1.4 Pre-existing File Write Reconciliation');
+      const filename = 'staggered_workers.pdf';
+      await fsp.writeFile(path.join(testLegacyUploadsDir, filename), content);
+
+      const record: HealthDataRecord = {
+        id: 'rec_staggered_04',
+        authorId: testUserId,
+        filePath: `/uploads/${filename}`,
+        fileType: 'application/pdf',
+        status: 'COMPLETED',
+      };
+
+      const worker1 = new LegacyMigrationWorkflow(storageDriver, {
+        legacyUploadsDir: testLegacyUploadsDir,
+        dryRun: false,
+      });
+      const worker2 = new LegacyMigrationWorkflow(storageDriver, {
+        legacyUploadsDir: testLegacyUploadsDir,
+        dryRun: false,
+      });
+
+      const res1 = await worker1.migrateRecord(record, testUserId);
+      expect(res1.status).toBe('SUCCESS');
+
+      const res2 = await worker2.migrateRecord(record, testUserId);
+      expect(res2.status).toBe('SUCCESS');
+      expect(res2.newStorageKey).toBe(res1.newStorageKey);
+    });
+
+    // 5. Both workers attempt a database update
+    it('Scenario 5: preserves consistent database state when both workers attempt database updates', async () => {
+      const content = Buffer.from('%PDF-1.4 Concurrency DB Update Test Document');
+      const filename = 'db_update_race.pdf';
+      await fsp.writeFile(path.join(testLegacyUploadsDir, filename), content);
+
+      const dbUpdates: Array<{ recordId: string; newKey: string }> = [];
+      const mockDbAdapter: MigrationDatabaseAdapter = {
+        async updateFilePath(recId, newKey) {
+          dbUpdates.push({ recordId: recId, newKey });
+        },
+      };
+
+      const record: HealthDataRecord = {
+        id: 'rec_db_race_05',
+        authorId: testUserId,
+        filePath: `/uploads/${filename}`,
+        fileType: 'application/pdf',
+        status: 'COMPLETED',
+      };
+
+      const worker1 = new LegacyMigrationWorkflow(storageDriver, {
+        legacyUploadsDir: testLegacyUploadsDir,
+        dryRun: false,
+        dbAdapter: mockDbAdapter,
+      });
+      const worker2 = new LegacyMigrationWorkflow(storageDriver, {
+        legacyUploadsDir: testLegacyUploadsDir,
+        dryRun: false,
+        dbAdapter: mockDbAdapter,
+      });
+
+      const [res1, res2] = await Promise.all([
+        worker1.migrateRecord(record, testUserId),
+        worker2.migrateRecord(record, testUserId),
+      ]);
+
+      expect(res1.status).toBe('SUCCESS');
+      expect(res2.status).toBe('SUCCESS');
+      expect(dbUpdates.length).toBe(2);
+      expect(dbUpdates[0].newKey).toBe(dbUpdates[1].newKey);
+    });
+
+    // 6. A worker fails after creating the destination
+    it('Scenario 6: rolls back destination file when worker database update fails', async () => {
+      const content = Buffer.from('%PDF-1.4 Rollback on Worker Failure Document');
+      const filename = 'fail_after_dest.pdf';
+      await fsp.writeFile(path.join(testLegacyUploadsDir, filename), content);
+
+      const mockFailingDb: MigrationDatabaseAdapter = {
+        async updateFilePath() {
+          throw new Error('Simulated database network timeout');
+        },
+      };
+
+      const worker = new LegacyMigrationWorkflow(storageDriver, {
+        legacyUploadsDir: testLegacyUploadsDir,
+        dryRun: false,
+        dbAdapter: mockFailingDb,
+      });
+
+      const record: HealthDataRecord = {
+        id: 'rec_fail_06',
+        authorId: testUserId,
+        filePath: `/uploads/${filename}`,
+        fileType: 'application/pdf',
+        status: 'COMPLETED',
+      };
+
+      const res = await worker.migrateRecord(record, testUserId);
+      expect(res.status).toBe('FAILED_DB_TRANSACTION');
+
+      const expectedKey = generateStorageKey(testUserId, 'pdf', record.id);
+      expect(await storageDriver.exists(expectedKey)).toBe(false);
+    });
+
+    // 7. A worker retries after the other worker succeeds
+    it('Scenario 7: skips migration idempotently when worker retries against already updated record', async () => {
+      const content = Buffer.from('%PDF-1.4 Worker Retry Test Content');
+      const filename = 'retry_after_success.pdf';
+      await fsp.writeFile(path.join(testLegacyUploadsDir, filename), content);
+
+      const record: HealthDataRecord = {
+        id: 'rec_retry_07',
+        authorId: testUserId,
+        filePath: `/uploads/${filename}`,
+        fileType: 'application/pdf',
+        status: 'COMPLETED',
+      };
+
+      const worker1 = new LegacyMigrationWorkflow(storageDriver, {
+        legacyUploadsDir: testLegacyUploadsDir,
+        dryRun: false,
+      });
+
+      const res1 = await worker1.migrateRecord(record, testUserId);
+      expect(res1.status).toBe('SUCCESS');
+
+      // Update record in mock database to reflect worker 1 completion
+      const updatedRecord: HealthDataRecord = {
+        ...record,
+        filePath: res1.newStorageKey ?? null,
+      };
+
+      const worker2 = new LegacyMigrationWorkflow(storageDriver, {
+        legacyUploadsDir: testLegacyUploadsDir,
+        dryRun: false,
+      });
+
+      const res2 = await worker2.migrateRecord(updatedRecord, testUserId);
+      expect(res2.status).toBe('SKIPPED_ALREADY_PRIVATE');
+    });
+
+    // 8. Two records from different users have different destination namespaces
+    it('Scenario 8: isolates destination namespaces when two different users migrate files with identical names', async () => {
+      const content = Buffer.from('%PDF-1.4 Shared Multi-tenant Document Content');
+      const filename = 'common_report.pdf';
+      await fsp.writeFile(path.join(testLegacyUploadsDir, filename), content);
+
+      const userA = 'patient_alpha';
+      const userB = 'patient_beta';
+
+      const recA: HealthDataRecord = {
+        id: 'rec_tenant_A',
+        authorId: userA,
+        filePath: `/uploads/${filename}`,
+        fileType: 'application/pdf',
+        status: 'COMPLETED',
+      };
+      const recB: HealthDataRecord = {
+        id: 'rec_tenant_B',
+        authorId: userB,
+        filePath: `/uploads/${filename}`,
+        fileType: 'application/pdf',
+        status: 'COMPLETED',
+      };
+
+      const workflow = new LegacyMigrationWorkflow(storageDriver, {
+        legacyUploadsDir: testLegacyUploadsDir,
+        dryRun: false,
+      });
+
+      const [resA, resB] = await Promise.all([
+        workflow.migrateRecord(recA, userA),
+        workflow.migrateRecord(recB, userB),
+      ]);
+
+      expect(resA.status).toBe('SUCCESS');
+      expect(resB.status).toBe('SUCCESS');
+      expect(resA.newStorageKey!.startsWith(`users/${userA}/`)).toBe(true);
+      expect(resB.newStorageKey!.startsWith(`users/${userB}/`)).toBe(true);
+      expect(resA.newStorageKey).not.toBe(resB.newStorageKey);
+    });
+
+    // 9. Existing destination data has a different SHA-256 hash
+    it('Scenario 9: refuses to overwrite existing destination data when existing SHA-256 hash conflicts', async () => {
+      const sourceContent = Buffer.from('%PDF-1.4 Authentic Patient Health Record');
+      const filename = 'patient_record.pdf';
+      await fsp.writeFile(path.join(testLegacyUploadsDir, filename), sourceContent);
+
+      const record: HealthDataRecord = {
+        id: 'rec_conflict_09',
+        authorId: testUserId,
+        filePath: `/uploads/${filename}`,
+        fileType: 'application/pdf',
+        status: 'COMPLETED',
+      };
+
+      const targetKey = generateStorageKey(testUserId, 'pdf', record.id);
+
+      // Pre-seed the destination key with conflicting content
+      const conflictingContent = Buffer.from('%PDF-1.4 Conflicting Pre-existing Content');
+      await storageDriver.writeStream(targetKey, Readable.from(conflictingContent));
+
+      const workflow = new LegacyMigrationWorkflow(storageDriver, {
+        legacyUploadsDir: testLegacyUploadsDir,
+        dryRun: false,
+      });
+
+      const result = await workflow.migrateRecord(record, testUserId);
+      expect(result.status).toBe('FAILED_CORRUPT_CHECKSUM');
+      expect(result.error).toContain('Storage key collision: destination object already exists with mismatched hash');
+
+      // Crucial: verify pre-existing destination file was NOT overwritten or deleted
+      const readRes = await storageDriver.readStream(targetKey);
+      const chunks: Buffer[] = [];
+      for await (const chunk of readRes.stream) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      }
+      expect(Buffer.concat(chunks).toString()).toBe(conflictingContent.toString());
+    });
+
+    // 10. A database update is attempted more than once (idempotent DB update)
+    it('Scenario 10: idempotently handles multiple database updates for the same migration target', async () => {
+      const content = Buffer.from('%PDF-1.4 Idempotent Database Update Test Document');
+      const filename = 'idempotent_db.pdf';
+      await fsp.writeFile(path.join(testLegacyUploadsDir, filename), content);
+
+      const dbMap = new Map<string, { key: string; metadata?: MigrationMetadata }>();
+      const idempotentDbAdapter: MigrationDatabaseAdapter = {
+        async updateFilePath(recId, newKey, metadata) {
+          const current = dbMap.get(recId);
+          if (current && current.key === newKey) {
+            // Idempotent retry: already at target key
+            return;
+          }
+          dbMap.set(recId, { key: newKey, metadata });
+        },
+      };
+
+      const record: HealthDataRecord = {
+        id: 'rec_idempotent_10',
+        authorId: testUserId,
+        filePath: `/uploads/${filename}`,
+        fileType: 'application/pdf',
+        status: 'COMPLETED',
+      };
+
+      const workflow = new LegacyMigrationWorkflow(storageDriver, {
+        legacyUploadsDir: testLegacyUploadsDir,
+        dryRun: false,
+        dbAdapter: idempotentDbAdapter,
+      });
+
+      const res1 = await workflow.migrateRecord(record, testUserId);
+      expect(res1.status).toBe('SUCCESS');
+      expect(dbMap.get(record.id)?.key).toBe(res1.newStorageKey);
+
+      // Re-run migration simulation (second attempt)
+      const res2 = await workflow.migrateRecord(record, testUserId);
+      expect(res2.status).toBe('SUCCESS');
+      expect(dbMap.get(record.id)?.key).toBe(res1.newStorageKey);
     });
   });
 });

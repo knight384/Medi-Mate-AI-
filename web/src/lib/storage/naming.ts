@@ -43,14 +43,15 @@ export function safeBasename(filename: string | null | undefined): string {
  */
 export function generateStorageKey(userId: string, extension: string, seed?: string): string {
   const safeExt = extension.replace(/^\./, '').toLowerCase().replace(/[^a-z0-9]/g, '');
-  const safeUser = safeBasename(userId);
-  if (!safeUser) {
+  const safeUser = safeBasename(userId).replace(/[^a-zA-Z0-9_-]/g, '_');
+  if (!safeUser || safeUser === '_') {
     throw new Error('Invalid userId for storage key generation');
   }
 
   let fileId: string;
   if (seed) {
-    const hex = crypto.createHash('sha256').update(`${userId}:${seed}`).digest('hex');
+    // Length-delimited framing prevents delimiter injection/collision across userId and seed
+    const hex = crypto.createHash('sha256').update(`${userId.length}:${userId}:${seed}`).digest('hex');
     fileId = `${hex.substring(0, 8)}-${hex.substring(8, 12)}-4${hex.substring(13, 16)}-a${hex.substring(17, 20)}-${hex.substring(20, 32)}`;
   } else {
     fileId = crypto.randomUUID();

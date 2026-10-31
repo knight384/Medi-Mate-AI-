@@ -308,6 +308,7 @@ export class LegacyMigrationWorkflow {
 
     // 10. Write to Private Storage with Crash-Recovery and Idempotent Reconciliation
     let destinationSha256: string;
+    let fileNewlyCreated = false;
     try {
       if (await this.storageDriver.exists(targetKey)) {
         // Interrupted migration or concurrent worker recovery: inspect existing file checksum
@@ -321,20 +322,46 @@ export class LegacyMigrationWorkflow {
         if (existingSha256 === sourceSha256) {
           // File was already completely written before a process crash or worker race
           destinationSha256 = existingSha256;
+          fileNewlyCreated = false;
         } else {
-          // Stale / partial write at deterministic key: delete and rewrite
-          await this.storageDriver.delete(targetKey);
-          const stored = await this.storageDriver.writeStream(targetKey, sourceStream, this.maxBytes);
-          destinationSha256 = stored.sha256;
+          // Conflicting data already exists at key: refuse to overwrite or destroy existing object
+          return {
+            ...baseResult,
+            status: 'FAILED_CORRUPT_CHECKSUM',
+            error: `Storage key collision: destination object already exists with mismatched hash: existing (${existingSha256}) !== source (${sourceSha256})`,
+          };
         }
       } else {
-        const stored = await this.storageDriver.writeStream(targetKey, sourceStream, this.maxBytes);
-        destinationSha256 = stored.sha256;
+        try {
+          const stored = await this.storageDriver.writeStream(targetKey, sourceStream, this.maxBytes);
+          destinationSha256 = stored.sha256;
+          fileNewlyCreated = true;
+        } catch (writeErr) {
+          // Concurrent worker race: if a competing worker completed writing the file, reconcile
+          if (await this.storageDriver.exists(targetKey)) {
+            const readResult = await this.storageDriver.readStream(targetKey);
+            const hash = crypto.createHash('sha256');
+            for await (const chunk of readResult.stream) {
+              hash.update(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+            }
+            const existingSha256 = hash.digest('hex');
+            if (existingSha256 === sourceSha256) {
+              destinationSha256 = existingSha256;
+              fileNewlyCreated = false;
+            } else {
+              throw writeErr;
+            }
+          } else {
+            throw writeErr;
+          }
+        }
       }
 
       // Verify checksum
       if (destinationSha256 !== sourceSha256) {
-        await this.storageDriver.delete(targetKey);
+        if (fileNewlyCreated) {
+          await this.storageDriver.delete(targetKey);
+        }
         return {
           ...baseResult,
           status: 'FAILED_CORRUPT_CHECKSUM',
@@ -364,11 +391,13 @@ export class LegacyMigrationWorkflow {
       try {
         await this.dbAdapter.updateFilePath(record.id, targetKey, migrationMetadata);
       } catch (dbError) {
-        // Atomic cleanup on DB failure: delete written file to prevent orphan storage
-        try {
-          await this.storageDriver.delete(targetKey);
-        } catch (cleanupErr) {
-          logger.error('Failed to cleanup storage after database rollback', { targetKey, error: cleanupErr });
+        // Atomic cleanup on DB failure: delete written file only if newly created by this worker to avoid deleting existing files
+        if (fileNewlyCreated) {
+          try {
+            await this.storageDriver.delete(targetKey);
+          } catch (cleanupErr) {
+            logger.error('Failed to cleanup storage after database rollback', { targetKey, error: cleanupErr });
+          }
         }
 
         return {

@@ -10,6 +10,7 @@
  *
  * Modifications: Ported from Python to TypeScript for MediMate AI.
  * Added cryptographic UUID storage key generation and path validation.
+ * Added optional deterministic seed support for crash-safe migration idempotency.
  */
 
 import crypto from 'node:crypto';
@@ -32,18 +33,29 @@ export function safeBasename(filename: string | null | undefined): string {
 }
 
 /**
- * Generates an opaque, cryptographically random storage key.
+ * Generates an opaque, cryptographically random (or deterministic) storage key.
  * Format: users/<userId>/<uuid>.<extension>
+ *
+ * When an optional seed (e.g. recordId) is provided, produces a deterministic UUIDv4-formatted
+ * key, ensuring that retries or concurrent workers converge on the same target file.
  *
  * Never uses the original filename as the physical storage path.
  */
-export function generateStorageKey(userId: string, extension: string): string {
+export function generateStorageKey(userId: string, extension: string, seed?: string): string {
   const safeExt = extension.replace(/^\./, '').toLowerCase().replace(/[^a-z0-9]/g, '');
-  const fileId = crypto.randomUUID();
   const safeUser = safeBasename(userId);
   if (!safeUser) {
     throw new Error('Invalid userId for storage key generation');
   }
+
+  let fileId: string;
+  if (seed) {
+    const hex = crypto.createHash('sha256').update(`${userId}:${seed}`).digest('hex');
+    fileId = `${hex.substring(0, 8)}-${hex.substring(8, 12)}-4${hex.substring(13, 16)}-a${hex.substring(17, 20)}-${hex.substring(20, 32)}`;
+  } else {
+    fileId = crypto.randomUUID();
+  }
+
   return `users/${safeUser}/${fileId}.${safeExt || 'bin'}`;
 }
 

@@ -1,4 +1,3 @@
-import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -171,64 +170,66 @@ export class LegacyMigrationWorkflow {
 
       const resolvedLocalPath = path.resolve(this.legacyUploadsDir, normalizedSubpath);
 
-      // Lexical path traversal check
-      const uploadsDirWithSep = this.legacyUploadsDir.endsWith(path.sep)
-        ? this.legacyUploadsDir
-        : this.legacyUploadsDir + path.sep;
-
-      if (!resolvedLocalPath.startsWith(uploadsDirWithSep) && resolvedLocalPath !== this.legacyUploadsDir) {
-        return {
-          ...baseResult,
-          status: 'FAILED_UNSUPPORTED_PATH',
-          error: 'Directory traversal attempt in legacy local path',
-        };
-      }
-
-      if (!fs.existsSync(resolvedLocalPath)) {
-        return {
-          ...baseResult,
-          status: 'FAILED_NOT_FOUND',
-          error: 'Source file does not exist in legacy uploads directory',
-        };
-      }
-
-      // Canonical realpath boundary check (prevents symlink and junction escape)
+      // Canonical realpath containment check via path.relative (prevents sibling /uploads-evil escapes and symlinks)
       try {
         const realUploadsDir = await fsp.realpath(this.legacyUploadsDir);
         const realLocalPath = await fsp.realpath(resolvedLocalPath);
-        const realUploadsWithSep = realUploadsDir.endsWith(path.sep)
-          ? realUploadsDir
-          : realUploadsDir + path.sep;
 
-        if (!realLocalPath.startsWith(realUploadsWithSep)) {
+        const rel = path.relative(realUploadsDir, realLocalPath);
+        if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
           return {
             ...baseResult,
             status: 'FAILED_UNSUPPORTED_PATH',
-            error: 'Symlink boundary escape attempt in legacy local path',
+            error: 'Path containment violation: target is outside legacy uploads directory',
           };
         }
       } catch {
         return {
           ...baseResult,
           status: 'FAILED_NOT_FOUND',
-          error: 'Failed to resolve canonical path for legacy file',
+          error: 'Source file does not exist or canonical path could not be resolved',
         };
       }
 
-      const stat = await fsp.stat(resolvedLocalPath);
-      if (!stat.isFile()) {
+      // TOCTOU-safe source access: open file handle once and read from the opened handle
+      let fileHandle: fsp.FileHandle;
+      try {
+        fileHandle = await fsp.open(resolvedLocalPath, 'r');
+      } catch {
         return {
           ...baseResult,
           status: 'FAILED_NOT_FOUND',
-          error: 'Legacy upload target is not a regular file',
+          error: 'Source file cannot be opened in legacy uploads directory',
         };
       }
 
-      sourceSize = stat.size;
-      extension = path.extname(resolvedLocalPath).toLowerCase();
+      let fileBuffer: Buffer;
+      try {
+        const stat = await fileHandle.stat();
+        if (!stat.isFile()) {
+          return {
+            ...baseResult,
+            status: 'FAILED_NOT_FOUND',
+            error: 'Legacy upload target is not a regular file',
+          };
+        }
 
-      // Compute source SHA-256
-      const fileBuffer = await fsp.readFile(resolvedLocalPath);
+        sourceSize = stat.size;
+        extension = path.extname(resolvedLocalPath).toLowerCase();
+
+        if (sourceSize > this.maxBytes) {
+          return {
+            ...baseResult,
+            status: 'FAILED_SIZE_EXCEEDED',
+            error: `File size ${sourceSize} bytes exceeds maximum limit of ${this.maxBytes} bytes`,
+          };
+        }
+
+        fileBuffer = await fileHandle.readFile();
+      } finally {
+        await fileHandle.close();
+      }
+
       sourceSha256 = crypto.createHash('sha256').update(fileBuffer).digest('hex');
       sourceStream = Readable.from(fileBuffer);
     } else {
@@ -258,7 +259,6 @@ export class LegacyMigrationWorkflow {
         sourceSha256 = blobData.sha256;
         sourceStream = blobData.stream;
       } else {
-        // Collect stream to compute SHA-256 if not pre-computed
         const chunks: Buffer[] = [];
         const hash = crypto.createHash('sha256');
         for await (const chunk of blobData.stream) {
@@ -291,8 +291,8 @@ export class LegacyMigrationWorkflow {
       };
     }
 
-    // 8. Generate Target Private Key (preserves ownership)
-    const targetKey = generateStorageKey(actorId, extension);
+    // 8. Generate Target Private Key using recordId seed for crash-safe deterministic idempotency
+    const targetKey = generateStorageKey(actorId, extension, record.id);
 
     // 9. Dry Run Exit: Validate everything, simulate key, but do not write to disk or DB
     if (this.dryRun) {
@@ -301,16 +301,36 @@ export class LegacyMigrationWorkflow {
         status: 'SUCCESS',
         newStorageKey: targetKey,
         sourceSha256,
-        destinationSha256: sourceSha256, // Simulated match
+        destinationSha256: sourceSha256,
         bytesTransferred: sourceSize,
       };
     }
 
-    // 10. Write to Private Storage via LocalStorageDriver
+    // 10. Write to Private Storage with Crash-Recovery and Idempotent Reconciliation
     let destinationSha256: string;
     try {
-      const stored = await this.storageDriver.writeStream(targetKey, sourceStream, this.maxBytes);
-      destinationSha256 = stored.sha256;
+      if (await this.storageDriver.exists(targetKey)) {
+        // Interrupted migration or concurrent worker recovery: inspect existing file checksum
+        const readResult = await this.storageDriver.readStream(targetKey);
+        const hash = crypto.createHash('sha256');
+        for await (const chunk of readResult.stream) {
+          hash.update(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        }
+        const existingSha256 = hash.digest('hex');
+
+        if (existingSha256 === sourceSha256) {
+          // File was already completely written before a process crash or worker race
+          destinationSha256 = existingSha256;
+        } else {
+          // Stale / partial write at deterministic key: delete and rewrite
+          await this.storageDriver.delete(targetKey);
+          const stored = await this.storageDriver.writeStream(targetKey, sourceStream, this.maxBytes);
+          destinationSha256 = stored.sha256;
+        }
+      } else {
+        const stored = await this.storageDriver.writeStream(targetKey, sourceStream, this.maxBytes);
+        destinationSha256 = stored.sha256;
+      }
 
       // Verify checksum
       if (destinationSha256 !== sourceSha256) {

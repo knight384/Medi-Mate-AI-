@@ -366,5 +366,70 @@ describe('Legacy Document Migration Workflow & Synthetic Dry-Run', () => {
       expect(await storageDriver.exists(resultA.newStorageKey!)).toBe(true);
       expect(await storageDriver.exists(resultB.newStorageKey!)).toBe(true);
     });
+
+    it('blocks directory escape via sibling directory using path.relative containment', async () => {
+      // Create sibling directory "legacy-uploads-evil" next to "legacy-uploads"
+      const siblingDir = path.join(testRootDir, 'legacy-uploads-evil');
+      await fsp.mkdir(siblingDir, { recursive: true });
+      const evilPdf = Buffer.from('%PDF-1.4 Exfiltrated Host File');
+      await fsp.writeFile(path.join(siblingDir, 'stolen.pdf'), evilPdf);
+
+      const workflow = new LegacyMigrationWorkflow(storageDriver, {
+        legacyUploadsDir: testLegacyUploadsDir,
+        dryRun: false,
+      });
+
+      const record: HealthDataRecord = {
+        id: 'rec_evil_sibling',
+        authorId: testUserId,
+        filePath: '/uploads/../legacy-uploads-evil/stolen.pdf',
+        fileType: 'application/pdf',
+        status: 'COMPLETED',
+      };
+
+      const result = await workflow.migrateRecord(record, testUserId);
+      expect(result.status).toBe('FAILED_UNSUPPORTED_PATH');
+    });
+
+    it('reconciles crash recovery idempotently when file was written prior to crash', async () => {
+      const syntheticPdf = Buffer.from('%PDF-1.4 Crash Recovery Reconciliation Test Document');
+      const legacyFileName = 'crash_recovery.pdf';
+      await fsp.writeFile(path.join(testLegacyUploadsDir, legacyFileName), syntheticPdf);
+
+      let dbCalls = 0;
+      const mockDbAdapter: MigrationDatabaseAdapter = {
+        async updateFilePath() {
+          dbCalls++;
+        },
+      };
+
+      const workflow = new LegacyMigrationWorkflow(storageDriver, {
+        legacyUploadsDir: testLegacyUploadsDir,
+        dryRun: false,
+        dbAdapter: mockDbAdapter,
+      });
+
+      const record: HealthDataRecord = {
+        id: 'rec_crash_recovery_101',
+        authorId: testUserId,
+        filePath: `/uploads/${legacyFileName}`,
+        fileType: 'application/pdf',
+        status: 'COMPLETED',
+      };
+
+      // 1. First run: normal migration
+      const result1 = await workflow.migrateRecord(record, testUserId);
+      expect(result1.status).toBe('SUCCESS');
+      expect(dbCalls).toBe(1);
+
+      // 2. Simulate worker crash before DB commit: DB was not updated in caller,
+      // but physical file exists at deterministic key.
+      // Re-running migration with the original filePath should detect existing file,
+      // verify SHA-256 match, and successfully complete without throwing collision.
+      const result2 = await workflow.migrateRecord(record, testUserId);
+      expect(result2.status).toBe('SUCCESS');
+      expect(result2.newStorageKey).toBe(result1.newStorageKey);
+      expect(dbCalls).toBe(2);
+    });
   });
 });

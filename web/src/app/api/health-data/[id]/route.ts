@@ -7,6 +7,7 @@ import { cacheService } from '@/lib/redis';
 import { readBoundedJson } from '@/lib/security/request-boundary';
 import { validateStructuralBounds } from '@/lib/security/structural-boundary';
 import { localStorageDriver, isValidStorageKey } from '@/lib/storage';
+import { withTenantContext } from '@/lib/db-tenant';
 import { logger } from '@/lib/logger';
 
 export interface HealthDataPatchRequest {
@@ -32,7 +33,27 @@ type HealthDataRecord = Prisma.HealthDataGetPayload<{
   };
 }>;
 
-async function fetchHealthDataRecord(id: string): Promise<HealthDataRecord> {
+async function fetchHealthDataRecord(id: string, userId?: string): Promise<HealthDataRecord> {
+  if (userId) {
+    return withTenantContext(userId, async (tx) => {
+      return tx.healthData.findUniqueOrThrow({
+        where: { id },
+        select: {
+          id: true,
+          type: true,
+          data: true,
+          metadata: true,
+          status: true,
+          fileType: true,
+          filePath: true,
+          createdAt: true,
+          updatedAt: true,
+          authorId: true,
+        },
+      });
+    });
+  }
+
   return prisma.healthData.findUniqueOrThrow({
     where: { id },
     select: {
@@ -66,7 +87,7 @@ export async function GET(
 
     const record = await cacheService.getOrSet(
       `health-data:${id}`,
-      () => fetchHealthDataRecord(id),
+      () => fetchHealthDataRecord(id, session.user.id),
       { ttlSeconds: 300 },
     );
 
@@ -96,15 +117,17 @@ export async function PATCH(
       maxArrayLength: 500,
     });
 
-    const existing = await prisma.healthData.findUniqueOrThrow({ where: { id } });
-    assertResourceOwner(existing.authorId, session.user.id);
-    if (existing.status === 'DELETING') {
-      throw new NotFoundError('Health data record not found');
-    }
+    const healthData = await withTenantContext(session.user.id, async (tx) => {
+      const existing = await tx.healthData.findUniqueOrThrow({ where: { id } });
+      assertResourceOwner(existing.authorId, session.user.id);
+      if (existing.status === 'DELETING') {
+        throw new NotFoundError('Health data record not found');
+      }
 
-    const healthData = await prisma.healthData.update({
-      where: { id },
-      data: body,
+      return tx.healthData.update({
+        where: { id },
+        data: body,
+      });
     });
 
     await cacheService.delete(`health-data:${id}`);
@@ -122,16 +145,19 @@ export async function DELETE(
     const session = await requireAuth();
     const { id } = await params;
 
-    const existing = await prisma.healthData.findUniqueOrThrow({ where: { id } });
-    assertResourceOwner(existing.authorId, session.user.id);
+    const existing = await withTenantContext(session.user.id, async (tx) => {
+      const record = await tx.healthData.findUniqueOrThrow({ where: { id } });
+      assertResourceOwner(record.authorId, session.user.id);
 
-    // 1. Mark status as DELETING in DB so concurrent access fails closed and state is recoverable
-    if (existing.status !== 'DELETING') {
-      await prisma.healthData.update({
-        where: { id },
-        data: { status: 'DELETING' },
-      });
-    }
+      // 1. Mark status as DELETING in DB so concurrent access fails closed and state is recoverable
+      if (record.status !== 'DELETING') {
+        await tx.healthData.update({
+          where: { id },
+          data: { status: 'DELETING' },
+        });
+      }
+      return record;
+    });
 
     // 2. Idempotent physical file deletion
     if (existing.filePath && isValidStorageKey(existing.filePath)) {
@@ -147,7 +173,9 @@ export async function DELETE(
     }
 
     // 3. Finalize database deletion and purge cache
-    await prisma.healthData.delete({ where: { id } });
+    await withTenantContext(session.user.id, async (tx) => {
+      await tx.healthData.delete({ where: { id } });
+    });
     await cacheService.delete(`health-data:${id}`);
     return NextResponse.json({ success: true });
   } catch (error) {

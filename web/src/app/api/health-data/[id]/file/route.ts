@@ -1,8 +1,8 @@
 import { NextRequest } from 'next/server';
-import prisma from '@/lib/prisma';
 import { requireAuth, assertResourceOwner } from '@/lib/api/auth-helpers';
 import { handleApiError, NotFoundError } from '@/lib/errors';
 import { localStorageDriver, safeBasename } from '@/lib/storage';
+import { withTenantContext } from '@/lib/db-tenant';
 import { Readable } from 'node:stream';
 
 export async function GET(
@@ -13,17 +13,19 @@ export async function GET(
     const session = await requireAuth();
     const { id } = await params;
 
-    const record = await prisma.healthData.findUnique({
-      where: { id },
-      select: {
-        id: true,
-        type: true,
-        status: true,
-        authorId: true,
-        filePath: true,
-        fileType: true,
-        data: true,
-      },
+    const record = await withTenantContext(session.user.id, async (tx) => {
+      return tx.healthData.findUnique({
+        where: { id },
+        select: {
+          id: true,
+          type: true,
+          status: true,
+          authorId: true,
+          filePath: true,
+          fileType: true,
+          data: true,
+        },
+      });
     });
 
     if (!record || record.status === 'DELETING') {

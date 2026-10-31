@@ -1,4 +1,4 @@
-import prisma, { Prisma } from "@/lib/prisma";
+import { Prisma } from "@/lib/prisma";
 import { NextRequest, NextResponse } from "next/server";
 import { parseHealthData } from "@/lib/health-data/parser/pdf";
 import { auth } from "@/auth";
@@ -12,6 +12,7 @@ import {
     localStorageDriver,
     generateStorageKey,
 } from '@/lib/storage';
+import { withTenantContext } from '@/lib/db-tenant';
 import { readBoundedMultipart } from '@/lib/storage/multipart-reader';
 
 export interface HealthData extends Prisma.HealthDataGetPayload<{
@@ -51,6 +52,7 @@ export async function POST(req: NextRequest) {
     if (!session || !session.user || !session.user.id) {
         return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
+    const userId = session.user.id;
 
     const contentType = req.headers.get('content-type');
     if (!contentType) {
@@ -72,8 +74,10 @@ export async function POST(req: NextRequest) {
             if (err instanceof AppError) return handleApiError(err);
             return NextResponse.json({ error: 'Invalid request payload' }, { status: 400 });
         }
-        const healthData = await prisma.healthData.create({
-            data: { ...data, authorId: session.user.id }
+        const healthData = await withTenantContext(userId, async (tx) => {
+            return tx.healthData.create({
+                data: { ...data, authorId: userId }
+            });
         });
         return NextResponse.json<HealthDataCreateResponse>(healthData);
     }
@@ -112,7 +116,7 @@ export async function POST(req: NextRequest) {
         const documentParserApiKey = fields.documentParserApiKey;
 
         const extension = path.extname(file.safeName) || '.bin';
-        const storageKey = generateStorageKey(session.user.id, extension);
+        const storageKey = generateStorageKey(userId, extension);
         const targetPath = localStorageDriver.resolveSecurePath(storageKey);
 
         try {
@@ -136,18 +140,20 @@ export async function POST(req: NextRequest) {
             sha256: file.sha256,
         };
 
-        let healthData;
+        let healthData: Prisma.HealthDataGetPayload<Record<string, never>> | null = null;
         try {
-            healthData = await prisma.healthData.create({
-                data: {
-                    id: id ? (id as string) : undefined,
-                    type: 'FILE',
-                    status: 'PARSING',
-                    filePath: storageKey,
-                    fileType: file.detectedMime,
-                    data: { ...baseData },
-                    authorId: session.user.id,
-                },
+            healthData = await withTenantContext(userId, async (tx) => {
+                return tx.healthData.create({
+                    data: {
+                        id: id ? (id as string) : undefined,
+                        type: 'FILE',
+                        status: 'PARSING',
+                        filePath: storageKey,
+                        fileType: file.detectedMime,
+                        data: { ...baseData },
+                        authorId: userId,
+                    },
+                });
             });
 
             // Process file through private OCR pipeline
@@ -166,28 +172,32 @@ export async function POST(req: NextRequest) {
                 } : undefined,
             });
 
-            healthData = await prisma.healthData.update({
-                where: { id: healthData.id },
-                data: {
-                    status: 'COMPLETED',
-                    metadata: JSON.parse(JSON.stringify({ ocr: ocrResults[0], dataPerPage: pages[0] })),
-                    data: { ...baseData, ...data[0] },
-                },
+            const updatedHealthData = await withTenantContext(userId, async (tx) => {
+                return tx.healthData.update({
+                    where: { id: healthData!.id },
+                    data: {
+                        status: 'COMPLETED',
+                        metadata: JSON.parse(JSON.stringify({ ocr: ocrResults[0], dataPerPage: pages[0] })),
+                        data: { ...baseData, ...data[0] },
+                    },
+                });
             });
 
-            return NextResponse.json(healthData);
+            return NextResponse.json(updatedHealthData);
         } catch (error) {
             logger.error('Error processing health data file', { message: getErrorMessage(error) });
             const parsingLogs: string[] = [`Error: ${getErrorMessage(error)}`];
             if (healthData) {
-                healthData = await prisma.healthData.update({
-                    where: { id: healthData.id },
-                    data: {
-                        status: 'COMPLETED',
-                        data: { ...baseData, parsingLogs },
-                    },
+                const errorHealthData = await withTenantContext(userId, async (tx) => {
+                    return tx.healthData.update({
+                        where: { id: healthData!.id },
+                        data: {
+                            status: 'COMPLETED',
+                            data: { ...baseData, parsingLogs },
+                        },
+                    });
                 });
-                return NextResponse.json(healthData);
+                return NextResponse.json(errorHealthData);
             }
             await localStorageDriver.delete(storageKey);
             return NextResponse.json({ error: 'Failed to process file' }, { status: 500 });
@@ -202,21 +212,25 @@ export async function GET() {
     if (!session || !session.user || !session.user.id) {
         return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
+    const userId = session.user.id;
 
-    // Create personal info if it doesn't exist
-    const personalInfo = await prisma.healthData.findFirst({
-        where: { authorId: session.user.id, type: 'PERSONAL_INFO' },
-    });
-    if (personalInfo === null) {
-        await prisma.healthData.create({
-            data: { type: 'PERSONAL_INFO', authorId: session.user.id, data: {} },
+    const { healthDataList } = await withTenantContext(userId, async (tx) => {
+        const personalInfo = await tx.healthData.findFirst({
+            where: { authorId: userId, type: 'PERSONAL_INFO' },
         });
-    }
+        if (personalInfo === null) {
+            await tx.healthData.create({
+                data: { type: 'PERSONAL_INFO', authorId: userId, data: {} },
+            });
+        }
 
-    const healthDataList = await prisma.healthData.findMany({
-        where: { authorId: session.user.id },
-        orderBy: { createdAt: 'asc' },
+        const list = await tx.healthData.findMany({
+            where: { authorId: userId },
+            orderBy: { createdAt: 'asc' },
+        });
+        return { healthDataList: list };
     });
+
     return NextResponse.json<HealthDataListResponse>({
         healthDataList,
     });

@@ -1,8 +1,8 @@
-import prisma from '@/lib/prisma';
 import { NextRequest, NextResponse } from 'next/server';
 import { ChatRoom } from '@/app/api/chat-rooms/route';
 import { assertResourceOwner, requireAuth } from '@/lib/api/auth-helpers';
 import { handleApiError, NotFoundError } from '@/lib/errors';
+import { withTenantContext } from '@/lib/db-tenant';
 
 export interface ChatRoomPatchRequest {
   assistantModeId: string;
@@ -42,9 +42,11 @@ export async function GET(
     const session = await requireAuth();
     const { id } = await params;
 
-    const chatRoom = await prisma.chatRoom.findUnique({
-      where: { id },
-      select: chatRoomSelect,
+    const chatRoom = await withTenantContext(session.user.id, async (tx) => {
+      return tx.chatRoom.findUnique({
+        where: { id },
+        select: chatRoomSelect,
+      });
     });
 
     if (!chatRoom) throw new NotFoundError('Chat room not found');
@@ -67,16 +69,18 @@ export async function PATCH(
     const { id } = await params;
     const body: ChatRoomPatchRequest = await req.json();
 
-    const existing = await prisma.chatRoom.findUniqueOrThrow({
-      where: { id },
-      select: { authorId: true },
-    });
-    assertResourceOwner(existing.authorId, session.user.id);
+    const chatRoom = await withTenantContext(session.user.id, async (tx) => {
+      const existing = await tx.chatRoom.findUniqueOrThrow({
+        where: { id },
+        select: { authorId: true },
+      });
+      assertResourceOwner(existing.authorId, session.user.id);
 
-    const chatRoom = await prisma.chatRoom.update({
-      where: { id },
-      data: body,
-      select: chatRoomSelect,
+      return tx.chatRoom.update({
+        where: { id },
+        data: body,
+        select: chatRoomSelect,
+      });
     });
 
     const { authorId, ...safeChatRoom } = chatRoom;
@@ -95,13 +99,15 @@ export async function DELETE(
     const session = await requireAuth();
     const { id } = await params;
 
-    const existing = await prisma.chatRoom.findUniqueOrThrow({
-      where: { id },
-      select: { authorId: true },
-    });
-    assertResourceOwner(existing.authorId, session.user.id);
+    await withTenantContext(session.user.id, async (tx) => {
+      const existing = await tx.chatRoom.findUniqueOrThrow({
+        where: { id },
+        select: { authorId: true },
+      });
+      assertResourceOwner(existing.authorId, session.user.id);
 
-    await prisma.chatRoom.delete({ where: { id } });
+      await tx.chatRoom.delete({ where: { id } });
+    });
     return new NextResponse(null, { status: 204 });
   } catch (error) {
     return handleApiError(error);

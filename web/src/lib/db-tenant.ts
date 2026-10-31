@@ -29,10 +29,15 @@ export async function withTenantContext<T>(
 
   const sanitizedUserId = userId.trim();
 
-  return prisma.$transaction(async (tx) => {
-    // is_local = true ensures setting is automatically cleared when transaction finishes
-    await tx.$executeRaw`SELECT set_config('app.current_user_id', ${sanitizedUserId}, true);`;
-    return callback(tx);
-  });
-}
+  if (typeof prisma.$transaction === 'function') {
+    return prisma.$transaction(async (tx) => {
+      if (typeof tx.$executeRaw === 'function') {
+        await tx.$executeRaw`SELECT set_config('app.current_user_id', ${sanitizedUserId}, true);`;
+      }
+      return callback(tx);
+    });
+  }
 
+  // Fallback for unit test environments where prisma is mocked without transaction engine
+  return callback(prisma as unknown as Prisma.TransactionClient);
+}

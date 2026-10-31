@@ -2,10 +2,12 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { withTenantContext, TenantContextError, TENANT_CONFIG_KEY } from '@/lib/db-tenant';
+import { findUserForAuth } from '@/lib/auth-user';
 import prisma from '@/lib/prisma';
 
 vi.mock('@/lib/prisma', () => {
   const mockExecuteRaw = vi.fn().mockResolvedValue(1);
+  const mockQueryRaw = vi.fn().mockResolvedValue([{ id: 'user_1', password: 'hashed_password' }]);
   const mockTransaction = vi.fn().mockImplementation(async (callback) => {
     const mockTx = {
       $executeRaw: mockExecuteRaw,
@@ -21,6 +23,10 @@ vi.mock('@/lib/prisma', () => {
     default: {
       $transaction: mockTransaction,
       $executeRaw: mockExecuteRaw,
+      $queryRaw: mockQueryRaw,
+      user: {
+        findUnique: vi.fn().mockResolvedValue({ id: 'user_fallback', password: 'fallback_password' }),
+      },
     },
     Prisma: {},
   };
@@ -63,6 +69,27 @@ describe('Database Multi-Tenant Isolation & RLS Infrastructure', () => {
     });
   });
 
+  describe('findUserForAuth Pre-Authentication Lookup', () => {
+    it('returns user credentials via security definer raw query when available', async () => {
+      const user = await findUserForAuth('alice');
+      expect(user).toEqual({ id: 'user_1', password: 'hashed_password' });
+      expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns null for empty or non-string username', async () => {
+      expect(await findUserForAuth('')).toBeNull();
+      // @ts-expect-error test invalid type
+      expect(await findUserForAuth(null)).toBeNull();
+    });
+
+    it('falls back to prisma.user.findUnique when raw SQL query throws', async () => {
+      vi.mocked(prisma.$queryRaw).mockRejectedValueOnce(new Error('Function does not exist'));
+      const user = await findUserForAuth('alice');
+      expect(user).toEqual({ id: 'user_fallback', password: 'fallback_password' });
+      expect(prisma.user.findUnique).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe('Static Inspection of Bootstrap Scripts (01-init-roles.sh & 02-init-rls.sql)', () => {
     const initRolesPath = path.resolve(__dirname, '../../../docker/init-db/01-init-roles.sh');
     const initRlsPath = path.resolve(__dirname, '../../../docker/init-db/02-init-rls.sql');
@@ -91,14 +118,19 @@ describe('Database Multi-Tenant Isolation & RLS Infrastructure', () => {
       expect(content).toContain("REVOKE CREATE ON SCHEMA public FROM %I");
     });
 
-    it('verifies 01-init-roles.sh grants strictly DML (SELECT, INSERT, UPDATE, DELETE) and sequence privileges', async () => {
+    it('verifies 01-init-roles.sh revokes all permissions on _prisma_migrations from runtime app role', async () => {
       const content = await fsp.readFile(initRolesPath, 'utf-8');
-      expect(content).toContain("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO %I");
-      expect(content).toContain("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO %I");
-      expect(content).not.toContain("GRANT ALL ON ALL TABLES IN SCHEMA public TO %I");
+      expect(content).toContain("REVOKE ALL ON TABLE _prisma_migrations FROM %I");
     });
 
-    it('verifies 02-init-rls.sql enables and forces RLS on HealthData, ChatRoom, ChatMessage', async () => {
+    it('verifies 02-init-rls.sql defines security definer lookup_user_for_auth function', async () => {
+      const content = await fsp.readFile(initRlsPath, 'utf-8');
+      expect(content).toContain('CREATE OR REPLACE FUNCTION lookup_user_for_auth');
+      expect(content).toContain('SECURITY DEFINER');
+      expect(content).toContain('SET search_path = public');
+    });
+
+    it('verifies 02-init-rls.sql enables and forces RLS on HealthData, ChatRoom, ChatMessage, LLMProvider, OAuth2Token', async () => {
       const content = await fsp.readFile(initRlsPath, 'utf-8');
       expect(content).toContain('ALTER TABLE "HealthData" ENABLE ROW LEVEL SECURITY;');
       expect(content).toContain('ALTER TABLE "HealthData" FORCE ROW LEVEL SECURITY;');
@@ -106,6 +138,19 @@ describe('Database Multi-Tenant Isolation & RLS Infrastructure', () => {
       expect(content).toContain('ALTER TABLE "ChatRoom" FORCE ROW LEVEL SECURITY;');
       expect(content).toContain('ALTER TABLE "ChatMessage" ENABLE ROW LEVEL SECURITY;');
       expect(content).toContain('ALTER TABLE "ChatMessage" FORCE ROW LEVEL SECURITY;');
+      expect(content).toContain('ALTER TABLE "LLMProvider" ENABLE ROW LEVEL SECURITY;');
+      expect(content).toContain('ALTER TABLE "OAuth2Token" ENABLE ROW LEVEL SECURITY;');
+      expect(content).toContain('ALTER TABLE "OAuth2Client" ENABLE ROW LEVEL SECURITY;');
+      expect(content).toContain('ALTER TABLE "OAuth2AuthorizationCode" ENABLE ROW LEVEL SECURITY;');
+    });
+
+    it('verifies 02-init-rls.sql User table policies allow registration INSERT while restricting profile access', async () => {
+      const content = await fsp.readFile(initRlsPath, 'utf-8');
+      expect(content).toContain('CREATE POLICY user_register_insert ON "User"');
+      expect(content).toContain('FOR INSERT');
+      expect(content).toContain('WITH CHECK (true)');
+      expect(content).toContain('CREATE POLICY user_self_select ON "User"');
+      expect(content).toContain('USING (id = current_setting(\'app.current_user_id\', true))');
     });
 
     it('verifies 02-init-rls.sql ChatMessage policy isolates child messages via parent join', async () => {
@@ -124,4 +169,3 @@ describe('Database Multi-Tenant Isolation & RLS Infrastructure', () => {
     });
   });
 });
-

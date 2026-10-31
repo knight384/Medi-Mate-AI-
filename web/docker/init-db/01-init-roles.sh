@@ -56,15 +56,25 @@ EXECUTE format('REVOKE CREATE ON SCHEMA public FROM %I', :'app_user');
 -- 5. Grant data manipulation privileges on existing tables to runtime app role
 EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO %I', :'app_user');
 
+-- Explicitly revoke access to migration history from application runtime
+IF EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename = '_prisma_migrations') THEN
+    EXECUTE format('REVOKE ALL ON TABLE _prisma_migrations FROM %I', :'app_user');
+END IF;
+
 -- 6. Grant sequence access on existing sequences to runtime app role
 EXECUTE format('GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO %I', :'app_user');
 
--- 7. Configure default privileges for future tables created by the migration owner
+-- 7. Grant execution on public helper functions (such as pre-auth lookup)
+EXECUTE format('GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO %I', :'app_user');
+
+-- 8. Configure default privileges for future tables created by the migration owner
 EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO %I', :'owner_user', :'app_user');
 
 EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO %I', :'owner_user', :'app_user');
 
--- 8. Restrict default PUBLIC privileges
+EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO %I', :'owner_user', :'app_user');
+
+-- 9. Restrict default PUBLIC privileges
 REVOKE ALL ON SCHEMA public FROM PUBLIC;
 GRANT USAGE ON SCHEMA public TO PUBLIC;
 

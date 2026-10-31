@@ -1,4 +1,4 @@
-FROM node:lts-alpine
+FROM node:24.22.2-alpine
 LABEL authors="OpenHealth"
 
 RUN apk add -U graphicsmagick
@@ -13,7 +13,8 @@ COPY . .
 
 RUN npm run build && \
     adduser --disabled-password ohuser && \
-    chown -R ohuser .
+    mkdir -p /app/storage && \
+    chown -R ohuser /app
 
 USER ohuser
 EXPOSE 3000

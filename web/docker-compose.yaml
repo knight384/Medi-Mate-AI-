@@ -41,7 +41,8 @@ services:
       docling-serve:
         condition: service_started
     volumes:
-      - app_data:/app/public/uploads
+      - app_storage:/app/storage
+      - app_data:/app/legacy_uploads:ro
     ports:
       - "3000:3000"
     restart: always
@@ -49,8 +50,10 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@database:5432/${POSTGRES_DB}
       REDIS_URL: redis://redis:6379
       REDIS_ENABLED: "true"
+      MEDIMATE_STORAGE_DIR: /app/storage
 
 volumes:
   postgres_data:
   redis_data:
+  app_storage:
   app_data:

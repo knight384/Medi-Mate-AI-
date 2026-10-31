@@ -41,6 +41,14 @@ BEGIN
     ELSE
         EXECUTE format('ALTER ROLE %I WITH LOGIN PASSWORD %L NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS', v_app_user, v_app_pass);
     END IF;
+
+    -- 2b. Create dedicated internal authentication role (NOLOGIN, BYPASSRLS for SECURITY DEFINER auth lookup)
+    -- This role cannot be logged into directly, cannot be assumed by app_user, and solely owns pre-auth functions.
+    IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_auth_definer') THEN
+        CREATE ROLE medimate_auth_definer NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE BYPASSRLS;
+    ELSE
+        ALTER ROLE medimate_auth_definer WITH NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE BYPASSRLS;
+    END IF;
 END
 $do$;
 
@@ -53,26 +61,50 @@ EXECUTE format('GRANT CONNECT ON DATABASE %I TO %I', :'target_db', :'app_user');
 EXECUTE format('GRANT USAGE ON SCHEMA public TO %I', :'app_user');
 EXECUTE format('REVOKE CREATE ON SCHEMA public FROM %I', :'app_user');
 
+-- Grant schema access and read privileges to dedicated auth definer role
+GRANT USAGE ON SCHEMA public TO medimate_auth_definer;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO medimate_auth_definer;
+
 -- 5. Grant data manipulation privileges on existing tables to runtime app role
 EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO %I', :'app_user');
 
 -- Explicitly revoke access to migration history from application runtime
-IF EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename = '_prisma_migrations') THEN
+IF EXISTS (SELECT FROM pg_catalog.pg_tables WHERE schemaname = 'public' AND tablename = '_prisma_migrations') THEN
     EXECUTE format('REVOKE ALL ON TABLE _prisma_migrations FROM %I', :'app_user');
 END IF;
 
 -- 6. Grant sequence access on existing sequences to runtime app role
 EXECUTE format('GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO %I', :'app_user');
 
--- 7. Grant execution on public helper functions (such as pre-auth lookup)
-EXECUTE format('GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO %I', :'app_user');
+-- 7. Restrict function execution: revoke blanket EXECUTE privileges from PUBLIC and runtime app role
+REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC;
+EXECUTE format('REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM %I', :'app_user');
 
--- 8. Configure default privileges for future tables created by the migration owner
+-- Explicitly grant execute ONLY on approved pre-auth functions to runtime app role
+DO $grant_fn$
+DECLARE
+    v_app_user text := :'app_user';
+BEGIN
+    IF EXISTS (
+        SELECT FROM pg_catalog.pg_proc p
+        JOIN pg_catalog.pg_namespace n ON p.pronamespace = n.oid
+        WHERE n.nspname = 'public' AND p.proname = 'lookup_user_for_auth'
+    ) THEN
+        EXECUTE format('GRANT EXECUTE ON FUNCTION public.lookup_user_for_auth(text) TO %I', v_app_user);
+    END IF;
+END
+$grant_fn$;
+
+-- 8. Configure default privileges for future objects created by the migration owner
 EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO %I', :'owner_user', :'app_user');
 
 EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO %I', :'owner_user', :'app_user');
 
-EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO %I', :'owner_user', :'app_user');
+EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public GRANT SELECT ON TABLES TO medimate_auth_definer', :'owner_user');
+
+-- Restrict default function execution privileges so newly created functions do NOT grant execute to PUBLIC or app_user
+EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC', :'owner_user');
+EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public REVOKE EXECUTE ON FUNCTIONS FROM %I', :'owner_user', :'app_user');
 
 -- 9. Restrict default PUBLIC privileges
 REVOKE ALL ON SCHEMA public FROM PUBLIC;

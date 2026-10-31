@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
-import prisma from '@/lib/prisma';
 import { LLMProvider } from '@/app/api/llm-providers/route';
 import { encrypt } from '@/lib/encryption';
 import { requireAuth } from '@/lib/api/auth-helpers';
 import { handleApiError } from '@/lib/errors';
+import { withTenantContext } from '@/lib/db-tenant';
 
 export interface LLMProviderPatchRequest {
   apiKey?: string;
@@ -18,7 +18,7 @@ export async function PATCH(
   { params }: { params: Promise<{ id: string }> },
 ) {
   try {
-    await requireAuth();
+    const session = await requireAuth();
     const { id } = await params;
     const body: LLMProviderPatchRequest = await req.json();
 
@@ -26,9 +26,11 @@ export async function PATCH(
       body.apiKey = encrypt(body.apiKey);
     }
 
-    const llmProvider = await prisma.lLMProvider.update({
-      where: { id },
-      data: body,
+    const llmProvider = await withTenantContext(session.user.id, async (tx) => {
+      return tx.lLMProvider.update({
+        where: { id },
+        data: body,
+      });
     });
 
     return NextResponse.json<LLMProviderPatchResponse>({ llmProvider });

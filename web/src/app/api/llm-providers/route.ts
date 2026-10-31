@@ -1,8 +1,9 @@
-import prisma, {Prisma} from "@/lib/prisma";
+import type {Prisma} from "@/lib/prisma";
 import {NextResponse} from "next/server";
 import {auth} from "@/auth";
 import {decrypt} from "@/lib/encryption";
 import {currentDeploymentEnv} from "@/lib/current-deployment-env";
+import {withTenantContext} from "@/lib/db-tenant";
 
 export interface LLMProvider extends Prisma.LLMProviderGetPayload<{
     select: {
@@ -22,14 +23,18 @@ export interface LLMProviderListResponse {
 
 export async function GET() {
     const session = await auth()
-    if (!session || !session.user) {
+    if (!session || !session.user || !session.user.id) {
         return NextResponse.json({error: 'Unauthorized'}, {status: 401})
     }
+    const userId = session.user.id;
 
-    const llmProviders = await prisma.lLMProvider.findMany({
-        where: {authorId: session.user.id},
-        orderBy: {order: 'asc'}
-    })
+    const llmProviders = await withTenantContext(userId, async (tx) => {
+        return tx.lLMProvider.findMany({
+            where: {authorId: userId},
+            orderBy: {order: 'asc'}
+        });
+    });
+
     return NextResponse.json<LLMProviderListResponse>({
         llmProviders: llmProviders
             .filter(({providerId}) => {
@@ -41,12 +46,14 @@ export async function GET() {
                 let decryptedApiKey: string
                 try {
                     decryptedApiKey = decrypt(provider.apiKey)
-                    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-                } catch (e) {
+                } catch {
                     decryptedApiKey = ''
                 }
 
-                return {...provider, apiKey: decryptedApiKey}
+                // Strictly ensure private API keys are never exposed if the provider is not user-owned
+                const apiKey = provider.authorId === userId ? decryptedApiKey : '';
+
+                return {...provider, apiKey}
             })
     })
 }

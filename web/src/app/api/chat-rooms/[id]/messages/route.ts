@@ -1,5 +1,5 @@
 import {NextRequest, NextResponse} from "next/server";
-import prisma, {Prisma} from "@/lib/prisma";
+import type {Prisma} from "@/lib/prisma";
 import {auth} from "@/auth";
 import {decrypt} from "@/lib/encryption";
 import {currentDeploymentEnv} from "@/lib/current-deployment-env";
@@ -9,6 +9,7 @@ import {ChatGoogleGenerativeAI} from "@langchain/google-genai";
 import { readBoundedJson } from "@/lib/security/request-boundary";
 import { validateStructuralBounds } from "@/lib/security/structural-boundary";
 import { handleApiError, AppError } from "@/lib/errors";
+import { withTenantContext } from "@/lib/db-tenant";
 
 export interface ChatMessage extends Prisma.ChatMessageGetPayload<{
     select: {
@@ -40,10 +41,18 @@ export async function GET(
     _req: NextRequest,
     {params}: { params: Promise<{ id: string }> }
 ) {
+    const session = await auth()
+    if (!session || !session.user || !session.user.id) {
+        return NextResponse.json({error: 'Unauthorized'}, {status: 401})
+    }
+    const userId = session.user.id;
     const {id} = await params
-    const chatMessages = await prisma.chatMessage.findMany({
-        where: {chatRoomId: id},
-        orderBy: {createdAt: 'asc'}
+
+    const chatMessages = await withTenantContext(userId, async (tx) => {
+        return tx.chatMessage.findMany({
+            where: {chatRoomId: id},
+            orderBy: {createdAt: 'asc'}
+        });
     });
 
     return NextResponse.json<ChatMessageListResponse>({chatMessages})
@@ -57,7 +66,8 @@ export async function POST(
 ) {
     const session = await auth()
     const user = session?.user
-    if (!session || !user) return NextResponse.json({error: 'Unauthorized'}, {status: 401})
+    if (!session || !user || !user.id) return NextResponse.json({error: 'Unauthorized'}, {status: 401})
+    const userId = user.id;
 
     const {id} = await params
     let body: ChatMessageCreateRequest
@@ -81,161 +91,119 @@ export async function POST(
         chatMessages,
         healthDataList,
         llmProvider
-    } = await prisma.$transaction(async (prisma) => {
-        await prisma.chatMessage.create({data: {content: body.content, role: body.role, chatRoomId: id}});
-        const {assistantMode} = await prisma.chatRoom.update({
+    } = await withTenantContext(userId, async (tx) => {
+        await tx.chatMessage.create({data: {content: body.content, role: body.role, chatRoomId: id}});
+        const {assistantMode} = await tx.chatRoom.update({
             where: {id},
             data: {lastActivityAt: new Date()},
             select: {assistantMode: {select: {systemPrompt: true}}}
         })
-        const chatMessages = await prisma.chatMessage.findMany({
+        const chatMessages = await tx.chatMessage.findMany({
             where: {chatRoomId: id},
             orderBy: {createdAt: 'asc'}
         })
-        const healthDataList = await prisma.healthData.findMany({where: {authorId: user.id}})
-        const chatRoom = await prisma.chatRoom.findUniqueOrThrow({where: {id}})
-        const llmProvider = await prisma.lLMProvider.findUniqueOrThrow({where: {id: chatRoom.llmProviderId}});
+        const healthDataList = await tx.healthData.findMany({where: {authorId: userId}})
+        const chatRoom = await tx.chatRoom.findUniqueOrThrow({where: {id}})
+        const llmProvider = await tx.lLMProvider.findUniqueOrThrow({where: {id: chatRoom.llmProviderId}});
         return {
             chatRoom,
-            chatMessages,
             assistantMode,
+            chatMessages,
             healthDataList,
             llmProvider
         }
-    })
+    });
 
-    let apiKey: string
-    if (currentDeploymentEnv === 'local') {
-        apiKey = decrypt(llmProvider.apiKey)
-    } else if (currentDeploymentEnv === 'cloud') {
-        switch (llmProvider.providerId) {
-            case 'openai':
-                apiKey = process.env.OPENAI_API_KEY as string
-                break;
-            case 'anthropic':
-                apiKey = process.env.ANTHROPIC_API_KEY as string
-                break;
-            case 'google':
-                apiKey = process.env.GOOGLE_API_KEY as string
-                break;
-            default:
-                throw new Error('Unsupported LLM provider');
-        }
+    let decryptedApiKey = ''
+    try {
+        decryptedApiKey = decrypt(llmProvider.apiKey)
+    } catch {
+        // If decryption fails, continue with empty string
+    }
+
+    const systemPrompt = `
+You are an AI medical assistant for the MediMate AI service.
+Respond following these guidelines:
+1. Provide helpful health-related information and advice.
+2. In case of an emergency, recommend visiting a hospital or calling emergency services immediately.
+3. Clearly state that your answer does not replace professional medical judgment.
+4. If you need more information to give an accurate answer, feel free to ask the user.
+5. Empathize with the user's symptoms and respond kindly.
+
+### Assistant Personality and Guidelines:
+${assistantMode.systemPrompt}
+
+### User Information:
+${healthDataList.map((data) => JSON.stringify(data.data)).join('\n')}
+`
+
+    const selectedModel = chatRoom.llmProviderModelId ?? undefined;
+    let chatModel: ChatOpenAI | ChatAnthropic | ChatGoogleGenerativeAI
+    if (llmProvider.providerId === 'openai') {
+        chatModel = new ChatOpenAI({
+            apiKey: currentDeploymentEnv === 'cloud' ? process.env.OPENAI_API_KEY : decryptedApiKey,
+            model: selectedModel,
+            configuration: {
+                baseURL: llmProvider.apiURL
+            }
+        });
+    } else if (llmProvider.providerId === 'anthropic') {
+        chatModel = new ChatAnthropic({
+            apiKey: currentDeploymentEnv === 'cloud' ? process.env.ANTHROPIC_API_KEY : decryptedApiKey,
+            model: selectedModel,
+            clientOptions: {
+                baseURL: llmProvider.apiURL
+            }
+        });
+    } else if (llmProvider.providerId === 'google') {
+        chatModel = new ChatGoogleGenerativeAI({
+            apiKey: currentDeploymentEnv === 'cloud' ? process.env.GOOGLE_API_KEY : decryptedApiKey,
+            model: selectedModel,
+        });
+    } else if (llmProvider.providerId === 'ollama') {
+        chatModel = new ChatOpenAI({
+            apiKey: 'ollama',
+            model: selectedModel,
+            configuration: {
+                baseURL: `${llmProvider.apiURL}/v1`
+            }
+        });
+    } else {
+        return NextResponse.json({error: 'Invalid LLM provider'}, {status: 400})
     }
 
     const messages = [
-        {"role": "system" as const, "content": assistantMode.systemPrompt},
         {
-            "role": "user" as const,
-            "content": `Health data sources: ${healthDataList.map((healthData) => `${healthData.type}: ${JSON.stringify(healthData.data)}`).join('\n')}`
+            role: 'system',
+            content: systemPrompt
         },
-        ...chatMessages.map((message) => ({
-            role: message.role.toLowerCase() as 'user' | 'assistant',
-            content: message.content
-        }))
+        ...chatMessages.map((message) => {
+            return {
+                role: message.role.toLowerCase(),
+                content: message.content
+            }
+        })
     ]
 
     const responseStream = new ReadableStream({
         async start(controller) {
-            let messageContent = '';
-
             try {
-                if (llmProvider.providerId === 'ollama') {
-                    const response = await fetch(`${llmProvider.apiURL}/api/chat`, {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({
-                            model: chatRoom.llmProviderModelId,
-                            messages: messages,
-                            stream: true,
-                        }),
-                    });
-
-                    const reader = response.body?.getReader();
-                    if (!reader) throw new Error('No reader available');
-
-                    while (true) {
-                        const {done, value} = await reader.read();
-                        if (done) break;
-
-                        const chunk = new TextDecoder().decode(value);
-                        const lines = chunk.split('\n').filter(line => line.trim());
-
-                        for (const line of lines) {
-                            if (line.includes('[DONE]')) continue;
-                            try {
-                                const json = JSON.parse(line);
-                                const content = json.message?.content;
-                                if (content) {
-                                    messageContent += content;
-                                    controller.enqueue(`${JSON.stringify({content: messageContent})}\n`);
-                                }
-                            } catch (e) {
-                                console.error('Error parsing JSON:', e);
-                            }
-                        }
-                    }
-                } else if (llmProvider.providerId === 'openai') {
-                    // OpenAI API call
-                    const llmProviderModelId = chatRoom.llmProviderModelId;
-                    if (!llmProviderModelId) throw new Error('No LLM model ID provided');
-                    const openai = new ChatOpenAI({
-                        apiKey,
-                        model: llmProviderModelId,
-                        configuration: {baseURL: llmProvider.apiURL},
-                        streaming: true,
-                    }).withConfig({metadata: {chatRoomId: id}, runName: 'chat'})
-
-                    const chatStream = await openai.stream(messages)
-                    for await (const part of chatStream) {
-                        const deltaContent = part.content.toString()
-                        if (deltaContent !== undefined) messageContent += deltaContent;
-                        controller.enqueue(`${JSON.stringify({content: messageContent})}\n`);
-                    }
-                } else if (llmProvider.providerId === 'anthropic') {
-                    const llmProviderModelId = chatRoom.llmProviderModelId;
-                    if (!llmProviderModelId) throw new Error('No LLM model ID provided');
-                    const anthropic = new ChatAnthropic({
-                        apiKey,
-                        anthropicApiUrl: llmProvider.apiURL,
-                        model: llmProviderModelId,
-                        maxTokens: 4096,
-                    }).withConfig({metadata: {chatRoomId: id}, runName: 'chat'})
-
-                    const chatStream = await anthropic.stream(messages)
-                    for await (const part of chatStream) {
-                        const deltaContent = part.content.toString()
-                        if (deltaContent !== undefined) messageContent += deltaContent;
-                        controller.enqueue(`${JSON.stringify({content: messageContent})}\n`);
-                    }
-                } else if (llmProvider.providerId == 'google') {
-                    const llmProviderModelId = chatRoom.llmProviderModelId;
-                    if (!llmProviderModelId) throw new Error('No LLM model ID provided');
-                    const gemini = new ChatGoogleGenerativeAI({
-                        apiKey,
-                        model: llmProviderModelId
-                    }).withConfig({metadata: {chatRoomId: id}, runName: 'chat'})
-
-                    const chatStream = await gemini.stream(messages)
-                    for await (const part of chatStream) {
-                        const deltaContent = part.content.toString()
-                        if (deltaContent !== undefined) messageContent += deltaContent;
-                        controller.enqueue(`${JSON.stringify({content: messageContent})}\n`);
-                    }
-                } else {
-                    throw new Error('Unsupported LLM provider');
+                const stream = await chatModel.stream(messages);
+                let messageContent = ''
+                for await (const chunk of stream) {
+                    messageContent += chunk.text
+                    controller.enqueue(`${JSON.stringify({text: chunk.text})}\n`);
                 }
 
-                // Save to prisma after the stream is done
-                await prisma.$transaction(async (prisma) => {
-                    await prisma.chatMessage.create({
+                await withTenantContext(userId, async (tx) => {
+                    await tx.chatMessage.create({
                         data: {
                             content: messageContent,
                             role: 'ASSISTANT',
                             chatRoomId: id
                         }
                     });
-                    await prisma.chatRoom.update({
+                    await tx.chatRoom.update({
                         where: {id}, data: {lastActivityAt: new Date(), name: messageContent}
                     })
                 });

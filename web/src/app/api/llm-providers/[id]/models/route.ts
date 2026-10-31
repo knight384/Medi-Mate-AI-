@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from 'next/server';
-import prisma from '@/lib/prisma';
 import OpenAI from 'openai';
 import Anthropic from '@anthropic-ai/sdk';
 import { decrypt } from '@/lib/encryption';
@@ -8,6 +7,7 @@ import { requireAuth } from '@/lib/api/auth-helpers';
 import { handleApiError } from '@/lib/errors';
 import { cacheService } from '@/lib/redis';
 import { logger } from '@/lib/logger';
+import { withTenantContext } from '@/lib/db-tenant';
 
 export interface LLMProviderModel {
   id: string;
@@ -108,10 +108,12 @@ export async function GET(
   { params }: { params: Promise<{ id: string }> },
 ) {
   try {
-    await requireAuth();
+    const session = await requireAuth();
     const { id } = await params;
 
-    const llmProvider = await prisma.lLMProvider.findUniqueOrThrow({ where: { id } });
+    const llmProvider = await withTenantContext(session.user.id, async (tx) => {
+      return tx.lLMProvider.findUniqueOrThrow({ where: { id } });
+    });
 
     const llmProviderModels = await cacheService.getOrSet(
       `llm-provider-models:${id}`,

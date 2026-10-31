@@ -1,7 +1,7 @@
 'use server';
 
 import {PersonalInfoData} from "@/components/onboarding/PersonalInfo";
-import prisma from "@/lib/prisma";
+import {withTenantContext} from "@/lib/db-tenant";
 import {auth} from "@/auth";
 
 interface OnboardingSubmitRequest {
@@ -14,9 +14,9 @@ export async function onboardingSubmit(data: OnboardingSubmitRequest) {
     const userId = session?.user?.id
     if (userId === undefined) throw new Error('User not found')
 
-    return prisma.$transaction(async (prisma) => {
-        const user = await prisma.user.findUniqueOrThrow({where: {id: userId}})
-        const personalInfo = await prisma.healthData.findFirst({
+    return withTenantContext(userId, async (tx) => {
+        const user = await tx.user.findUniqueOrThrow({where: {id: userId}})
+        const personalInfo = await tx.healthData.findFirst({
             where: {authorId: userId, type: 'PERSONAL_INFO'}
         })
         const personalInfoData = {
@@ -29,7 +29,7 @@ export async function onboardingSubmit(data: OnboardingSubmitRequest) {
             country: data.personalInfo.country,
         }
         if (personalInfo === null) {
-            await prisma.healthData.create({
+            await tx.healthData.create({
                 data: {
                     type: 'PERSONAL_INFO',
                     authorId: userId,
@@ -39,11 +39,11 @@ export async function onboardingSubmit(data: OnboardingSubmitRequest) {
                 }
             })
         } else {
-            await prisma.healthData.update({where: {id: personalInfo.id}, data: {data: personalInfoData}})
+            await tx.healthData.update({where: {id: personalInfo.id}, data: {data: personalInfoData}})
         }
 
         // Save symptoms
-        await prisma.healthData.create({
+        await tx.healthData.create({
             data: {
                 type: 'SYMPTOMS',
                 authorId: userId,
@@ -52,11 +52,11 @@ export async function onboardingSubmit(data: OnboardingSubmitRequest) {
         })
 
         // Update onboarding status
-        await prisma.user.update({where: {id: userId}, data: {hasOnboarded: true}})
+        await tx.user.update({where: {id: userId}, data: {hasOnboarded: true}})
 
         // ChatRoom assistant modes 채팅 전부 생성
-        const llmProvider = await prisma.lLMProvider.findFirstOrThrow({where: {providerId: 'openai'}})
-        const assistantModes = await prisma.assistantMode.findMany({
+        const llmProvider = await tx.lLMProvider.findFirstOrThrow({where: {providerId: 'openai'}})
+        const assistantModes = await tx.assistantMode.findMany({
             where: {
                 OR: [
                     {authorId: userId, visibility: 'PRIVATE'},
@@ -65,7 +65,7 @@ export async function onboardingSubmit(data: OnboardingSubmitRequest) {
                 name: {in: ['Root Cause Analysis & Long Term Health.', 'Family Medicine', 'Best Doctor']}
             }
         })
-        return prisma.chatRoom.createManyAndReturn({
+        return tx.chatRoom.createManyAndReturn({
             data: assistantModes.map((mode) => {
                 return {
                     name: 'New Chat',

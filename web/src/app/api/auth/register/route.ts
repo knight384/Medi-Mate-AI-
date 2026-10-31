@@ -37,20 +37,24 @@ export async function POST(request: Request) {
         // Hash the password
         const hashedPassword = await hash(password, 10);
 
-        // Save the user to the database
-        await prisma.$transaction(async (prisma) => {
-
-            // Create a new user
-            const user = await prisma.user.create({
+        // Save the user to the database within an isolated transaction
+        await prisma.$transaction(async (tx) => {
+            // Create a new user (strictly bounded fields to prevent privilege escalation)
+            const user = await tx.user.create({
                 data: {
                     username,
                     password: hashedPassword,
                     hasOnboarded: false,
                 }
-            })
+            });
 
-            // Create a assistant mode
-            await prisma.assistantMode.createMany({
+            // Set tenant context for this transaction so subsequent inserts pass RLS checks
+            if (typeof tx.$executeRaw === 'function') {
+                await tx.$executeRaw`SELECT set_config('app.current_user_id', ${user.id}, true);`;
+            }
+
+            // Create assistant modes for the newly registered user
+            await tx.assistantMode.createMany({
                 data: assistantModeSeed.map((mode) => ({
                     ...mode,
                     authorId: user.id,
@@ -58,14 +62,14 @@ export async function POST(request: Request) {
                 })),
             });
 
-            // Create a llm
-            await prisma.lLMProvider.createMany({
+            // Create llm providers for the newly registered user
+            await tx.lLMProvider.createMany({
                 data: llmProviderSeed.map((provider) => ({
                     ...provider,
                     authorId: user.id
                 })),
             });
-        })
+        });
 
         return NextResponse.json({message: "success"}, {status: 201});
     } catch (e) {

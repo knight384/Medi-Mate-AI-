@@ -1426,4 +1426,147 @@ describe('PostgreSQL Live Authentication, RLS & Role Privilege Verification (Che
       });
     });
   });
+
+  describe('Database Inventory Reconciliation, Migration Reliability & Release Isolation (Checkpoint 5D.18)', () => {
+    it('authoritatively reconciles physical table inventory against pg_tables and pg_class', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      const expectedTables = [
+        'AssistantMode',
+        'AssistantModeContext',
+        'ChatMessage',
+        'ChatRoom',
+        'HealthData',
+        'LLMProvider',
+        'OAuth2AuthorizationCode',
+        'OAuth2Client',
+        'OAuth2Token',
+        'RedditAccessToken',
+        'RedditPost',
+        'RedditPostComment',
+        'User',
+      ].sort();
+
+      const physicalTables = await prisma.$queryRawUnsafe<
+        Array<{ tablename: string; tableowner: string; rowsecurity: boolean; forcerowsecurity: boolean }>
+      >(`
+        SELECT 
+          t.tablename, 
+          t.tableowner, 
+          t.rowsecurity,
+          c.relforcerowsecurity as forcerowsecurity
+        FROM pg_catalog.pg_tables t
+        JOIN pg_catalog.pg_class c ON c.relname = t.tablename
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace AND n.nspname = t.schemaname
+        WHERE t.schemaname = 'public'
+          AND t.tablename NOT IN ('_prisma_migrations')
+        ORDER BY t.tablename;
+      `);
+
+      const actualTableNames = physicalTables.map((t) => t.tablename).sort();
+      expect(actualTableNames).toEqual(expectedTables);
+
+      for (const t of physicalTables) {
+        expect(t.tableowner).toBe('medimate_owner');
+        expect(t.rowsecurity).toBe(true);
+        expect(t.forcerowsecurity).toBe(true);
+      }
+    });
+
+    it('verifies every _owner_all policy has explicit USING (true) and WITH CHECK (true) targeting medimate_owner', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      const policies = await prisma.$queryRawUnsafe<
+        Array<{ tablename: string; policyname: string; roles: string[]; cmd: string; qual: string; with_check: string }>
+      >(`
+        SELECT tablename, policyname, roles, cmd, qual, with_check
+        FROM pg_catalog.pg_policies
+        WHERE schemaname = 'public'
+          AND policyname LIKE '%_owner_all'
+        ORDER BY tablename;
+      `);
+
+      expect(policies.length).toBe(13);
+      for (const pol of policies) {
+        expect(pol.roles).toEqual(['medimate_owner']);
+        expect(pol.cmd).toBe('ALL');
+        expect(pol.qual).toBe('true');
+        expect(pol.with_check).toBe('true');
+      }
+    });
+
+    it('verifies strict RLS policy manager rejects unexpected application tables in public schema', async (ctx) => {
+      if (!isPostgresLive || !ownerPrisma) {
+        ctx.skip();
+        return;
+      }
+
+      // 1. Normal state verifies cleanly in strict mode
+      await expect(ownerPrisma.$executeRawUnsafe('SELECT public.apply_medimate_rls_policies(true);')).resolves.not.toThrow();
+
+      // 2. An unexpected table causes apply_medimate_rls_policies(true) to fail visibly
+      try {
+        await ownerPrisma.$executeRawUnsafe('CREATE TABLE public.unexpected_canary_table (id text PRIMARY KEY);');
+        await expect(ownerPrisma.$executeRawUnsafe('SELECT public.apply_medimate_rls_policies(true);')).rejects.toThrow(
+          /Unexpected table public\."unexpected_canary_table" found in schema public/i
+        );
+      } finally {
+        await ownerPrisma.$executeRawUnsafe('DROP TABLE IF EXISTS public.unexpected_canary_table;');
+        // Restore strict verified state
+        await ownerPrisma.$executeRawUnsafe('SELECT public.apply_medimate_rls_policies(true);');
+      }
+    });
+
+    it('verifies current_user matches medimate_app for runtime client and medimate_owner for migration client', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      const appUser = await prisma.$queryRawUnsafe<Array<{ current_user: string; current_database: string }>>(
+        'SELECT current_user, current_database();'
+      );
+      expect(appUser[0].current_user).toBe('medimate_app');
+      expect(appUser[0].current_database).toBe('open-health');
+
+      if (ownerPrisma) {
+        const ownerUser = await ownerPrisma.$queryRawUnsafe<Array<{ current_user: string; current_database: string }>>(
+          'SELECT current_user, current_database();'
+        );
+        expect(ownerUser[0].current_user).toBe('medimate_owner');
+        expect(ownerUser[0].current_database).toBe('open-health');
+      }
+    });
+
+    it('verifies multi-statement transactional atomicity on DDL failure', async (ctx) => {
+      if (!isPostgresLive || !ownerPrisma) {
+        ctx.skip();
+        return;
+      }
+
+      // Execute a transaction that attempts DDL then deliberately fails
+      await expect(
+        ownerPrisma.$executeRawUnsafe(`
+          DO $$
+          BEGIN
+            CREATE TABLE public.failing_tx_test_canary (id text PRIMARY KEY);
+            RAISE EXCEPTION 'Deliberate migration step failure';
+          END;
+          $$;
+        `)
+      ).rejects.toThrow(/Deliberate migration step failure/i);
+
+      // Verify table does not exist in catalog due to transaction rollback
+      const check = await ownerPrisma.$queryRawUnsafe<Array<{ regclass: string | null }>>(
+        `SELECT to_regclass('public.failing_tx_test_canary')::text as regclass;`
+      );
+      expect(check[0].regclass).toBeNull();
+    });
+  });
 });

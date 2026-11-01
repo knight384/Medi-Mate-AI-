@@ -44,8 +44,10 @@ BEGIN
 
     IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = v_app_user) THEN
         EXECUTE format('CREATE ROLE %I WITH LOGIN PASSWORD %L NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS', v_app_user, v_app_pass);
+        EXECUTE format('ALTER ROLE %I WITH NOINHERIT', v_app_user);
     ELSE
         EXECUTE format('ALTER ROLE %I WITH LOGIN PASSWORD %L NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS', v_app_user, v_app_pass);
+        EXECUTE format('ALTER ROLE %I WITH NOINHERIT', v_app_user);
     END IF;
 
     IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_auth_definer') THEN

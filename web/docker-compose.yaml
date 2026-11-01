@@ -39,6 +39,19 @@ services:
     image: ghcr.io/docling-project/docling-serve:v1.38.2@sha256:8a5fbc993da9dec17c53880e2445834591ad26800ef698ca64096bef29671808
     restart: always
 
+  release-job:
+    build:
+      context: .
+      dockerfile: Containerfile
+    profiles: ["migration"]
+    depends_on:
+      database:
+        condition: service_healthy
+    entrypoint: ["npm", "run", "db:migrate:deploy"]
+    environment:
+      DATABASE_URL: postgresql://${APP_DB_USER:-medimate_app}:${APP_DB_PASSWORD:?Set APP_DB_PASSWORD}@database:5432/${POSTGRES_DB:-open-health}
+      MIGRATION_DATABASE_URL: postgresql://${OWNER_DB_USER:-medimate_owner}:${OWNER_DB_PASSWORD:?Set OWNER_DB_PASSWORD}@database:5432/${POSTGRES_DB:-open-health}
+
   app:
     build:
       context: .
@@ -58,7 +71,6 @@ services:
     restart: always
     environment:
       DATABASE_URL: postgresql://${APP_DB_USER:-medimate_app}:${APP_DB_PASSWORD:?Set APP_DB_PASSWORD}@database:5432/${POSTGRES_DB:-open-health}
-      MIGRATION_DATABASE_URL: postgresql://${OWNER_DB_USER:-medimate_owner}:${OWNER_DB_PASSWORD:?Set OWNER_DB_PASSWORD}@database:5432/${POSTGRES_DB:-open-health}
       REDIS_URL: redis://redis:6379
       REDIS_ENABLED: "true"
       MEDIMATE_STORAGE_DIR: /app/storage

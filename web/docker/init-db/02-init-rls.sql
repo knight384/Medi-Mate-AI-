@@ -68,11 +68,22 @@ DECLARE
         'RedditPostComment'
     ];
 BEGIN
-    -- Strict mode validation: fail visibly if any required clinical/security table is missing (Task B)
+    -- Strict mode validation: fail visibly if any required clinical/security table is missing or if unexpected tables exist
     IF p_strict THEN
         FOREACH v_tab IN ARRAY v_expected_tables LOOP
             IF NOT EXISTS (SELECT FROM pg_catalog.pg_tables WHERE schemaname = 'public' AND tablename = v_tab) THEN
                 RAISE EXCEPTION 'MediMate AI RLS verification failed: Required table public."%" does not exist', v_tab;
+            END IF;
+        END LOOP;
+
+        FOR r IN (
+            SELECT tablename
+            FROM pg_catalog.pg_tables
+            WHERE schemaname = 'public'
+              AND tablename NOT IN ('_prisma_migrations')
+        ) LOOP
+            IF NOT (r.tablename = ANY(v_expected_tables)) THEN
+                RAISE EXCEPTION 'MediMate AI RLS verification failed: Unexpected table public."%" found in schema public', r.tablename;
             END IF;
         END LOOP;
     END IF;

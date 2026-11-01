@@ -1,11 +1,12 @@
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import prisma from '@/lib/prisma';
 import { withTenantContext } from '@/lib/db-tenant';
+import { PrismaClient } from '@prisma/client';
 
 /**
  * MediMate AI: Real PostgreSQL Security & RLS Integration Test Suite
  *
- * Checkpoint 5D.14 requirements:
+ * Checkpoint 5D.16 requirements:
  * 1. Fail-fast mode when explicitly requested (REQUIRE_LIVE_POSTGRES=true).
  * 2. Proper SKIPPED status (ctx.skip()) when database is unreachable during normal test runs.
  * 3. Function permissions: lookup_user_for_auth execution, definer ownership, search_path, SET ROLE rejection.
@@ -16,10 +17,48 @@ import { withTenantContext } from '@/lib/db-tenant';
  * 8. Connection pooling safety: no context leak across pooled client connections.
  * 9. Migration ledger security: _prisma_migrations ledger denial to app role.
  * 10. Complete table coverage: All 13 tables verified for RLS and FORCE RLS.
+ * 11. Behavioral isolation across all tenant-owned tables:
+ *     - User (profile isolation, immutable fields, password denial)
+ *     - HealthData (tenant CRUD isolation, fail-closed)
+ *     - ChatRoom & ChatMessage (room isolation, parent-join message isolation, foreign room insertion rejection)
+ *     - AssistantMode & AssistantModeContext (public vs private visibility, owner modification, context isolation)
+ *     - LLMProvider (owner isolation, system default empty-key exposure, non-empty system key protection)
+ *     - OAuth2Client, OAuth2AuthorizationCode, OAuth2Token (user_id tenant isolation)
+ *     - RedditAccessToken, RedditPost, RedditPostComment (complete medimate_app denial, worker role boundary)
  */
 
-describe('PostgreSQL Live Authentication, RLS & Role Privilege Verification (Checkpoint 5D.14)', () => {
+describe('PostgreSQL Live Authentication, RLS & Role Privilege Verification (Checkpoint 5D.16)', () => {
   let isPostgresLive = false;
+  let ownerPrisma: PrismaClient | null = null;
+
+  const alphaId = 'synthetic_test_alpha_user_5d16';
+  const betaId = 'synthetic_test_beta_user_5d16';
+  const alphaUsername = 'synth_alpha_user_5d16';
+  const betaUsername = 'synth_beta_user_5d16';
+  const alphaPasswordHash = '$2a$10$abcdefghijklmnopqrstuvwxyz123456';
+  const betaPasswordHash = '$2a$10$abcdefghijklmnopqrstuvwxyz123456';
+
+  async function cleanFixtures(client: PrismaClient) {
+    const statements = [
+      `DELETE FROM public."ChatMessage" WHERE id LIKE 'synth_%'`,
+      `DELETE FROM public."ChatRoom" WHERE id LIKE 'synth_%'`,
+      `DELETE FROM public."AssistantModeContext" WHERE id LIKE 'synth_%'`,
+      `DELETE FROM public."AssistantMode" WHERE id LIKE 'synth_%'`,
+      `DELETE FROM public."HealthData" WHERE id LIKE 'synth_%'`,
+      `DELETE FROM public."OAuth2Token" WHERE id LIKE 'synth_%'`,
+      `DELETE FROM public."OAuth2AuthorizationCode" WHERE id LIKE 'synth_%'`,
+      `DELETE FROM public."OAuth2Client" WHERE id LIKE 'synth_%'`,
+      `DELETE FROM public."LLMProvider" WHERE id LIKE 'synth_%'`,
+      `DELETE FROM public."User" WHERE id IN ('${alphaId}', '${betaId}')`,
+    ];
+    for (const stmt of statements) {
+      try {
+        await client.$executeRawUnsafe(stmt);
+      } catch {
+        // ignore during initial cleanup
+      }
+    }
+  }
 
   beforeAll(async () => {
     try {
@@ -35,8 +74,135 @@ describe('PostgreSQL Live Authentication, RLS & Role Privilege Verification (Che
 
     if (process.env.REQUIRE_LIVE_POSTGRES === 'true' && !isPostgresLive) {
       throw new Error(
-        '[LIVE-POSTGRESQL-BLOCKED] PostgreSQL connection to disposable test container medimate-rls-5d12-test is required but offline or unreachable.'
+        '[LIVE-POSTGRESQL-BLOCKED] PostgreSQL connection to disposable test container is required but offline or unreachable.'
       );
+    }
+
+    if (isPostgresLive && process.env.MIGRATION_DATABASE_URL) {
+      ownerPrisma = new PrismaClient({
+        datasources: { db: { url: process.env.MIGRATION_DATABASE_URL } },
+      });
+
+      // Reset and seed synthetic test fixtures as owner (bypasses RLS to establish known state)
+      try {
+        await cleanFixtures(ownerPrisma);
+
+        // 1. Synthetic Users
+        await ownerPrisma.$executeRawUnsafe(`
+          INSERT INTO public."User" (id, username, password, name, "hasOnboarded", "createdAt", "updatedAt")
+          VALUES 
+            ('${alphaId}', '${alphaUsername}', '${alphaPasswordHash}', 'Alpha Patient', true, NOW(), NOW()),
+            ('${betaId}', '${betaUsername}', '${betaPasswordHash}', 'Beta Patient', true, NOW(), NOW())
+          ON CONFLICT (id) DO UPDATE 
+            SET name = EXCLUDED.name, "hasOnboarded" = EXCLUDED."hasOnboarded", "updatedAt" = NOW();
+        `);
+
+        // 2. Synthetic LLM Providers (System empty-key, System non-empty-key, Alpha private, Beta private)
+        await ownerPrisma.$executeRawUnsafe(`
+          INSERT INTO public."LLMProvider" (id, "providerId", name, "apiKey", "authorId", "createdAt", "updatedAt", "apiURL", "order")
+          VALUES 
+            ('synth_sys_llm_prov_01', 'openai', 'System OpenAI', '', NULL, NOW(), NOW(), 'https://api.openai.com/v1', 1),
+            ('synth_sys_llm_prov_secret', 'anthropic_secret', 'System Secret Claude', 'sys-secret-key-12345', NULL, NOW(), NOW(), 'https://api.anthropic.com/v1', 2),
+            ('synth_alpha_llm_prov_01', 'custom_alpha', 'Alpha Provider', 'sk-alpha-custom-key', '${alphaId}', NOW(), NOW(), 'https://custom.alpha.ai', 3),
+            ('synth_beta_llm_prov_01', 'custom_beta', 'Beta Provider', 'sk-beta-custom-key', '${betaId}', NOW(), NOW(), 'https://custom.beta.ai', 4)
+          ON CONFLICT (id) DO UPDATE 
+            SET "apiKey" = EXCLUDED."apiKey", "authorId" = EXCLUDED."authorId", "updatedAt" = NOW();
+        `);
+
+        // 3. Synthetic AssistantModes (Public vs Private)
+        await ownerPrisma.$executeRawUnsafe(`
+          INSERT INTO public."AssistantMode" (id, name, description, "systemPrompt", visibility, "authorId", "llmProviderId", "createdAt", "updatedAt")
+          VALUES 
+            ('synth_pub_assistant_01', 'Public General Triage', 'Public triage mode', 'You are a general health assistant', 'PUBLIC', NULL, 'synth_sys_llm_prov_01', NOW(), NOW()),
+            ('synth_alpha_assistant_01', 'Alpha Private Oncology', 'Alpha private oncology mode', 'You are an oncology specialist', 'PRIVATE', '${alphaId}', 'synth_alpha_llm_prov_01', NOW(), NOW()),
+            ('synth_beta_assistant_01', 'Beta Private Cardiology', 'Beta private cardiology mode', 'You are a cardiology specialist', 'PRIVATE', '${betaId}', 'synth_beta_llm_prov_01', NOW(), NOW())
+          ON CONFLICT (id) DO UPDATE 
+            SET visibility = EXCLUDED.visibility, "authorId" = EXCLUDED."authorId", "updatedAt" = NOW();
+        `);
+
+        // 4. Synthetic AssistantModeContexts
+        await ownerPrisma.$executeRawUnsafe(`
+          INSERT INTO public."AssistantModeContext" (id, "assistantModeId", data, "createdAt", "updatedAt")
+          VALUES 
+            ('synth_pub_ctx_01', 'synth_pub_assistant_01', 'Public general medical knowledge guidelines', NOW(), NOW()),
+            ('synth_alpha_ctx_01', 'synth_alpha_assistant_01', 'Alpha private clinical oncology notes', NOW(), NOW()),
+            ('synth_beta_ctx_01', 'synth_beta_assistant_01', 'Beta private cardiology titration guidelines', NOW(), NOW())
+          ON CONFLICT (id) DO UPDATE 
+            SET data = EXCLUDED.data, "updatedAt" = NOW();
+        `);
+
+        // 5. Synthetic ChatRooms
+        await ownerPrisma.$executeRawUnsafe(`
+          INSERT INTO public."ChatRoom" (id, name, "assistantModeId", "llmProviderId", "authorId", "createdAt", "updatedAt")
+          VALUES 
+            ('synth_alpha_room_01', 'Alpha Confidential Consultation', 'synth_pub_assistant_01', 'synth_sys_llm_prov_01', '${alphaId}', NOW(), NOW()),
+            ('synth_beta_room_01', 'Beta Confidential Consultation', 'synth_pub_assistant_01', 'synth_sys_llm_prov_01', '${betaId}', NOW(), NOW())
+          ON CONFLICT (id) DO UPDATE 
+            SET name = EXCLUDED.name, "authorId" = EXCLUDED."authorId", "updatedAt" = NOW();
+        `);
+
+        // 6. Synthetic ChatMessages
+        await ownerPrisma.$executeRawUnsafe(`
+          INSERT INTO public."ChatMessage" (id, content, "chatRoomId", role, "createdAt", "updatedAt")
+          VALUES 
+            ('synth_alpha_msg_01', 'Alpha private symptom report: recurring fever and night sweats', 'synth_alpha_room_01', 'USER', NOW(), NOW()),
+            ('synth_beta_msg_01', 'Beta private symptom report: elevated heart rate and palpitations', 'synth_beta_room_01', 'USER', NOW(), NOW())
+          ON CONFLICT (id) DO UPDATE 
+            SET content = EXCLUDED.content, "updatedAt" = NOW();
+        `);
+
+        // 7. Synthetic HealthData
+        await ownerPrisma.$executeRawUnsafe(`
+          INSERT INTO public."HealthData" (id, type, data, "authorId", "createdAt", "updatedAt")
+          VALUES 
+            ('synth_alpha_doc_01', 'LAB_RESULT', '{"hemoglobin": 14.2, "wbc": 6800}'::jsonb, '${alphaId}', NOW(), NOW()),
+            ('synth_beta_doc_01', 'LAB_RESULT', '{"cholesterol": 210, "ldl": 130}'::jsonb, '${betaId}', NOW(), NOW())
+          ON CONFLICT (id) DO UPDATE 
+            SET data = EXCLUDED.data, "authorId" = EXCLUDED."authorId", "updatedAt" = NOW();
+        `);
+
+        // 8. Synthetic OAuth2 records (separate statements for prepared statement compatibility)
+        await ownerPrisma.$executeRawUnsafe(`
+          INSERT INTO public."OAuth2Client" (id, "user_id", "client_id", "client_secret", "client_metadata")
+          VALUES 
+            ('synth_alpha_oauth_client_01', '${alphaId}', 'cid_alpha_client_01', 'csec_alpha_secret_01', '{"app_name":"Alpha Health App"}'),
+            ('synth_beta_oauth_client_01', '${betaId}', 'cid_beta_client_01', 'csec_beta_secret_01', '{"app_name":"Beta Health App"}')
+          ON CONFLICT (id) DO UPDATE 
+            SET "user_id" = EXCLUDED."user_id";
+        `);
+
+        await ownerPrisma.$executeRawUnsafe(`
+          INSERT INTO public."OAuth2AuthorizationCode" (id, "user_id", "client_id", code, "response_type", "auth_time")
+          VALUES 
+            ('synth_alpha_auth_code_01', '${alphaId}', 'cid_alpha_client_01', 'code_alpha_secret_xyz', 'code', 1700000000),
+            ('synth_beta_auth_code_01', '${betaId}', 'cid_beta_client_01', 'code_beta_secret_xyz', 'code', 1700000000)
+          ON CONFLICT (id) DO UPDATE 
+            SET "user_id" = EXCLUDED."user_id";
+        `);
+
+        await ownerPrisma.$executeRawUnsafe(`
+          INSERT INTO public."OAuth2Token" (id, "user_id", "client_id", "token_type", "access_token", "issued_at")
+          VALUES 
+            ('synth_alpha_token_01', '${alphaId}', 'cid_alpha_client_01', 'Bearer', 'tok_alpha_access_111', 1700000000),
+            ('synth_beta_token_01', '${betaId}', 'cid_beta_client_01', 'Bearer', 'tok_beta_access_222', 1700000000)
+          ON CONFLICT (id) DO UPDATE 
+            SET "user_id" = EXCLUDED."user_id";
+        `);
+      } catch (err) {
+        console.warn('Fixture setup error (continuing):', err);
+      }
+    }
+  });
+
+  afterAll(async () => {
+    if (ownerPrisma) {
+      try {
+        await cleanFixtures(ownerPrisma);
+      } catch (err) {
+        console.warn('Fixture teardown error:', err);
+      } finally {
+        await ownerPrisma.$disconnect();
+      }
     }
   });
 
@@ -44,14 +210,14 @@ describe('PostgreSQL Live Authentication, RLS & Role Privilege Verification (Che
     it('verifies live database connection status without masking offline state', () => {
       if (!isPostgresLive) {
         console.warn(
-          '[LIVE-POSTGRESQL-BLOCKED] Disposable PostgreSQL service (medimate-rls-5d12-test) is offline or unreachable. Live queries are BLOCKED until container is started.'
+          '[LIVE-POSTGRESQL-BLOCKED] Disposable PostgreSQL service is offline or unreachable. Live queries are BLOCKED until container is started.'
         );
       }
       expect(typeof isPostgresLive).toBe('boolean');
     });
   });
 
-  describe('Function Permissions (lookup_user_for_auth)', () => {
+  describe('Security-Definer Function Catalog Attributes & Permissions (Part F)', () => {
     it('verifies lookup_user_for_auth function attributes in PostgreSQL catalog', async (ctx) => {
       if (!isPostgresLive) {
         ctx.skip();
@@ -108,7 +274,35 @@ describe('PostgreSQL Live Authentication, RLS & Role Privilege Verification (Che
       expect(fn.proconfig).toContain('search_path=pg_catalog, public, pg_temp');
     });
 
-    it('verifies medimate_app cannot SET ROLE to medimate_auth_definer or medimate_owner', async (ctx) => {
+    it('verifies trg_apply_rls_on_ddl is owned by medimate_owner with safe search_path', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      const procs = await prisma.$queryRawUnsafe<
+        Array<{
+          proname: string;
+          prosecdef: boolean;
+          proconfig: string[] | null;
+          owner_role: string;
+        }>
+      >(`
+        SELECT p.proname, p.prosecdef, p.proconfig, r.rolname as owner_role
+        FROM pg_catalog.pg_proc p
+        JOIN pg_catalog.pg_namespace n ON p.pronamespace = n.oid
+        JOIN pg_catalog.pg_roles r ON p.proowner = r.oid
+        WHERE n.nspname = 'public' AND p.proname = 'trg_apply_rls_on_ddl';
+      `);
+
+      expect(procs.length).toBe(1);
+      const fn = procs[0];
+      expect(fn.prosecdef).toBe(true);
+      expect(fn.owner_role).toBe('medimate_owner');
+      expect(fn.proconfig).toContain('search_path=pg_catalog, public, pg_temp');
+    });
+
+    it('verifies medimate_app cannot SET ROLE to medimate_auth_definer, medimate_owner, or medimate_reddit_worker', async (ctx) => {
       if (!isPostgresLive) {
         ctx.skip();
         return;
@@ -121,26 +315,31 @@ describe('PostgreSQL Live Authentication, RLS & Role Privilege Verification (Che
       await expect(
         prisma.$executeRawUnsafe('SET ROLE medimate_owner;')
       ).rejects.toThrow();
+
+      await expect(
+        prisma.$executeRawUnsafe('SET ROLE medimate_reddit_worker;')
+      ).rejects.toThrow();
     });
 
-    it('verifies PUBLIC has no execute privilege on lookup_user_for_auth', async (ctx) => {
+    it('verifies PUBLIC has no execute privilege on lookup_user_for_auth or apply_medimate_rls_policies', async (ctx) => {
       if (!isPostgresLive) {
         ctx.skip();
         return;
       }
 
-      const grants = await prisma.$queryRawUnsafe<Array<{ count: number }>>(`
-        SELECT count(*)::int as count
+      const grants = await prisma.$queryRawUnsafe<Array<{ routine_name: string; count: number }>>(`
+        SELECT routine_name, count(*)::int as count
         FROM information_schema.routine_privileges
         WHERE routine_schema = 'public'
-          AND routine_name = 'lookup_user_for_auth'
-          AND grantee = 'PUBLIC';
+          AND routine_name IN ('lookup_user_for_auth', 'apply_medimate_rls_policies', 'trg_apply_rls_on_ddl')
+          AND grantee = 'PUBLIC'
+        GROUP BY routine_name;
       `);
 
-      expect(grants[0].count).toBe(0);
+      expect(grants.length).toBe(0);
     });
 
-    it('verifies medimate_app is denied execute on apply_medimate_rls_policies', async (ctx) => {
+    it('verifies medimate_app is denied execute on apply_medimate_rls_policies and trg_apply_rls_on_ddl', async (ctx) => {
       if (!isPostgresLive) {
         ctx.skip();
         return;
@@ -149,17 +348,31 @@ describe('PostgreSQL Live Authentication, RLS & Role Privilege Verification (Che
       await expect(
         prisma.$executeRawUnsafe('SELECT public.apply_medimate_rls_policies(false);')
       ).rejects.toThrow(/permission denied/i);
+
+      await expect(
+        prisma.$executeRawUnsafe('SELECT public.trg_apply_rls_on_ddl();')
+      ).rejects.toThrow(/permission denied/i);
     });
 
-    it('verifies medimate_app is denied execute on trg_apply_rls_on_ddl', async (ctx) => {
+    it('verifies medimate_app can execute lookup_user_for_auth and retrieve user auth credentials safely', async (ctx) => {
       if (!isPostgresLive) {
         ctx.skip();
         return;
       }
 
-      await expect(
-        prisma.$executeRawUnsafe('SELECT public.trg_apply_rls_on_ddl();')
-      ).rejects.toThrow(/permission denied/i);
+      const rows = await prisma.$queryRawUnsafe<Array<{ id: string; password: string }>>(
+        `SELECT id, password FROM public.lookup_user_for_auth('${alphaUsername}');`
+      );
+
+      expect(rows.length).toBe(1);
+      expect(rows[0].id).toBe(alphaId);
+      expect(rows[0].password).toBe(alphaPasswordHash);
+
+      // Non-existent user lookup returns empty array without throwing
+      const emptyRows = await prisma.$queryRawUnsafe<Array<{ id: string; password: string }>>(
+        "SELECT id, password FROM public.lookup_user_for_auth('non_existent_username_xyz');"
+      );
+      expect(emptyRows.length).toBe(0);
     });
   });
 
@@ -176,7 +389,7 @@ describe('PostgreSQL Live Authentication, RLS & Role Privilege Verification (Che
     });
   });
 
-  describe('User Table Column Privileges', () => {
+  describe('User Table Isolation & Column Least-Privilege (Part E)', () => {
     it('verifies direct selection of User.password is rejected with permission error', async (ctx) => {
       if (!isPostgresLive) {
         ctx.skip();
@@ -228,12 +441,52 @@ describe('PostgreSQL Live Authentication, RLS & Role Privilege Verification (Che
         `)
       ).rejects.toThrow(/permission denied/i);
     });
+
+    it('verifies Alpha cannot read or update Beta user profile', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      // Without tenant context, User query returns 0 rows due to RLS
+      const noContextRows = await prisma.$queryRawUnsafe<Array<{ id: string }>>(
+        `SELECT id, name, username FROM public."User" WHERE id = '${alphaId}';`
+      );
+      expect(noContextRows.length).toBe(0);
+
+      // Under Alpha tenant context: can see Alpha, cannot see Beta
+      await withTenantContext(alphaId, async (tx) => {
+        const alphaRows = await tx.$queryRawUnsafe<Array<{ id: string; username: string }>>(
+          `SELECT id, username FROM public."User" WHERE id = '${alphaId}';`
+        );
+        expect(alphaRows.length).toBe(1);
+        expect(alphaRows[0].username).toBe(alphaUsername);
+
+        const betaRows = await tx.$queryRawUnsafe<Array<{ id: string; username: string }>>(
+          `SELECT id, username FROM public."User" WHERE id = '${betaId}';`
+        );
+        expect(betaRows.length).toBe(0);
+
+        // Alpha cannot update Beta's profile
+        const updateBetaCount = await tx.$executeRawUnsafe(`
+          UPDATE public."User"
+          SET name = 'Tampered By Alpha'
+          WHERE id = '${betaId}';
+        `);
+        expect(updateBetaCount).toBe(0);
+
+        // Alpha can update Alpha's own mutable profile field
+        const updateSelfCount = await tx.$executeRawUnsafe(`
+          UPDATE public."User"
+          SET name = 'Alpha Renamed'
+          WHERE id = '${alphaId}';
+        `);
+        expect(updateSelfCount).toBe(1);
+      });
+    });
   });
 
-  describe('Multi-Tenant RLS Alpha/Beta Isolation & Session Hygiene', () => {
-    const alphaId = 'synthetic_test_alpha_user_5d14';
-    const betaId = 'synthetic_test_beta_user_5d14';
-
+  describe('HealthData Behavioral Isolation (Part E)', () => {
     it('verifies query without tenant context returns 0 clinical rows', async (ctx) => {
       if (!isPostgresLive) {
         ctx.skip();
@@ -289,6 +542,492 @@ describe('PostgreSQL Live Authentication, RLS & Role Privilege Verification (Che
       });
     });
 
+    it('verifies Alpha can read and insert Alpha own health records', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      await withTenantContext(alphaId, async (tx) => {
+        const records = await tx.$queryRawUnsafe<Array<{ id: string; type: string }>>(`
+          SELECT id, type FROM public."HealthData" WHERE id = 'synth_alpha_doc_01';
+        `);
+        expect(records.length).toBe(1);
+        expect(records[0].type).toBe('LAB_RESULT');
+
+        const insertCount = await tx.$executeRawUnsafe(`
+          INSERT INTO public."HealthData" (id, type, data, "authorId", "createdAt", "updatedAt")
+          VALUES ('synth_alpha_doc_new', 'PRESCRIPTION', '{"dosage":"50mg"}'::jsonb, '${alphaId}', NOW(), NOW())
+          ON CONFLICT (id) DO UPDATE SET type = EXCLUDED.type;
+        `);
+        expect(insertCount).toBe(1);
+      });
+    });
+  });
+
+  describe('ChatRoom and ChatMessage Behavioral Isolation (Part E)', () => {
+    it('verifies query without tenant context returns 0 chat rooms and 0 chat messages', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      const rooms = await prisma.$queryRawUnsafe<Array<{ id: string }>>('SELECT id FROM public."ChatRoom";');
+      expect(rooms.length).toBe(0);
+
+      const msgs = await prisma.$queryRawUnsafe<Array<{ id: string }>>('SELECT id FROM public."ChatMessage";');
+      expect(msgs.length).toBe(0);
+    });
+
+    it('verifies Alpha cannot read, update, or delete Beta chat rooms', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      await withTenantContext(alphaId, async (tx) => {
+        const betaRooms = await tx.$queryRawUnsafe<Array<{ id: string }>>(
+          `SELECT id FROM public."ChatRoom" WHERE id = 'synth_beta_room_01';`
+        );
+        expect(betaRooms.length).toBe(0);
+
+        const updateCount = await tx.$executeRawUnsafe(
+          `UPDATE public."ChatRoom" SET name = 'Tampered' WHERE id = 'synth_beta_room_01';`
+        );
+        expect(updateCount).toBe(0);
+
+        const deleteCount = await tx.$executeRawUnsafe(
+          `DELETE FROM public."ChatRoom" WHERE id = 'synth_beta_room_01';`
+        );
+        expect(deleteCount).toBe(0);
+
+        // Alpha can read Alpha's own chat room
+        const alphaRooms = await tx.$queryRawUnsafe<Array<{ id: string; name: string }>>(
+          `SELECT id, name FROM public."ChatRoom" WHERE id = 'synth_alpha_room_01';`
+        );
+        expect(alphaRooms.length).toBe(1);
+        expect(alphaRooms[0].name).toContain('Alpha');
+      });
+    });
+
+    it('verifies Alpha cannot read or manipulate messages in Beta chat room', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      await withTenantContext(alphaId, async (tx) => {
+        // Message join isolation: Beta's room messages are invisible to Alpha
+        const betaMsgs = await tx.$queryRawUnsafe<Array<{ id: string; content: string }>>(
+          `SELECT id, content FROM public."ChatMessage" WHERE id = 'synth_beta_msg_01';`
+        );
+        expect(betaMsgs.length).toBe(0);
+
+        const updateCount = await tx.$executeRawUnsafe(
+          `UPDATE public."ChatMessage" SET content = 'Tampered Message' WHERE id = 'synth_beta_msg_01';`
+        );
+        expect(updateCount).toBe(0);
+
+        const deleteCount = await tx.$executeRawUnsafe(
+          `DELETE FROM public."ChatMessage" WHERE id = 'synth_beta_msg_01';`
+        );
+        expect(deleteCount).toBe(0);
+
+        // Alpha can read messages in Alpha's own chat room
+        const alphaMsgs = await tx.$queryRawUnsafe<Array<{ id: string; content: string }>>(
+          `SELECT id, content FROM public."ChatMessage" WHERE id = 'synth_alpha_msg_01';`
+        );
+        expect(alphaMsgs.length).toBe(1);
+        expect(alphaMsgs[0].content).toContain('Alpha private symptom report');
+      });
+    });
+
+    it('verifies Alpha cannot insert a message into Beta chat room (parent join check)', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      // Negative check in dedicated transaction
+      await withTenantContext(alphaId, async (tx) => {
+        await expect(
+          tx.$executeRawUnsafe(`
+            INSERT INTO public."ChatMessage" (id, content, "chatRoomId", role, "createdAt", "updatedAt")
+            VALUES ('spoofed_msg_01', 'Injected message', 'synth_beta_room_01', 'USER', NOW(), NOW());
+          `)
+        ).rejects.toThrow();
+      });
+
+      // Positive check in clean transaction: inserting into Alpha's own room succeeds
+      await withTenantContext(alphaId, async (tx) => {
+        const insertCount = await tx.$executeRawUnsafe(`
+          INSERT INTO public."ChatMessage" (id, content, "chatRoomId", role, "createdAt", "updatedAt")
+          VALUES ('synth_alpha_msg_new', 'Legitimate Alpha reply', 'synth_alpha_room_01', 'ASSISTANT', NOW(), NOW())
+          ON CONFLICT (id) DO UPDATE SET content = EXCLUDED.content;
+        `);
+        expect(insertCount).toBe(1);
+      });
+    });
+  });
+
+  describe('AssistantMode & AssistantModeContext Behavioral Isolation (Part E)', () => {
+    it('verifies query without tenant context returns only PUBLIC modes and 0 private modes', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      const modes = await prisma.$queryRawUnsafe<Array<{ id: string; visibility: string }>>(
+        `SELECT id, visibility FROM public."AssistantMode" WHERE id IN ('synth_pub_assistant_01', 'synth_alpha_assistant_01', 'synth_beta_assistant_01');`
+      );
+      expect(modes.length).toBe(1);
+      expect(modes[0].id).toBe('synth_pub_assistant_01');
+      expect(modes[0].visibility).toBe('PUBLIC');
+    });
+
+    it('verifies Alpha cannot read or modify Beta private AssistantMode', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      await withTenantContext(alphaId, async (tx) => {
+        const betaModes = await tx.$queryRawUnsafe<Array<{ id: string }>>(
+          `SELECT id FROM public."AssistantMode" WHERE id = 'synth_beta_assistant_01';`
+        );
+        expect(betaModes.length).toBe(0);
+
+        const updateBeta = await tx.$executeRawUnsafe(
+          `UPDATE public."AssistantMode" SET name = 'Tampered' WHERE id = 'synth_beta_assistant_01';`
+        );
+        expect(updateBeta).toBe(0);
+
+        // Alpha can read and update Alpha's own private mode
+        const alphaModes = await tx.$queryRawUnsafe<Array<{ id: string; name: string }>>(
+          `SELECT id, name FROM public."AssistantMode" WHERE id = 'synth_alpha_assistant_01';`
+        );
+        expect(alphaModes.length).toBe(1);
+        expect(alphaModes[0].name).toContain('Alpha Private');
+
+        // Alpha can read public mode
+        const pubModes = await tx.$queryRawUnsafe<Array<{ id: string }>>(
+          `SELECT id FROM public."AssistantMode" WHERE id = 'synth_pub_assistant_01';`
+        );
+        expect(pubModes.length).toBe(1);
+
+        // Alpha CANNOT modify public mode owned by NULL
+        const updatePub = await tx.$executeRawUnsafe(
+          `UPDATE public."AssistantMode" SET name = 'Tampered Public' WHERE id = 'synth_pub_assistant_01';`
+        );
+        expect(updatePub).toBe(0);
+      });
+    });
+
+    it('verifies AssistantModeContext respects parent mode visibility and ownership', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      // Without tenant context: only public mode context is visible
+      const unauthedCtxs = await prisma.$queryRawUnsafe<Array<{ id: string }>>(
+        `SELECT id FROM public."AssistantModeContext" WHERE id IN ('synth_pub_ctx_01', 'synth_alpha_ctx_01', 'synth_beta_ctx_01');`
+      );
+      expect(unauthedCtxs.length).toBe(1);
+      expect(unauthedCtxs[0].id).toBe('synth_pub_ctx_01');
+
+      // Under Alpha tenant context:
+      await withTenantContext(alphaId, async (tx) => {
+        // Can see public context and Alpha's private context
+        const visibleCtxs = await tx.$queryRawUnsafe<Array<{ id: string }>>(
+          `SELECT id FROM public."AssistantModeContext" WHERE id IN ('synth_pub_ctx_01', 'synth_alpha_ctx_01', 'synth_beta_ctx_01');`
+        );
+        const visibleIds = visibleCtxs.map((c) => c.id).sort();
+        expect(visibleIds).toEqual(['synth_alpha_ctx_01', 'synth_pub_ctx_01']);
+
+        // Cannot see Beta's private context
+        const betaCtx = await tx.$queryRawUnsafe<Array<{ id: string }>>(
+          `SELECT id FROM public."AssistantModeContext" WHERE id = 'synth_beta_ctx_01';`
+        );
+        expect(betaCtx.length).toBe(0);
+      });
+
+      // Negative check in separate transaction
+      await withTenantContext(alphaId, async (tx) => {
+        // Cannot insert context into Beta's mode
+        await expect(
+          tx.$executeRawUnsafe(`
+            INSERT INTO public."AssistantModeContext" (id, "assistantModeId", data, "createdAt", "updatedAt")
+            VALUES ('injected_ctx_01', 'synth_beta_assistant_01', 'Injected data', NOW(), NOW());
+          `)
+        ).rejects.toThrow();
+      });
+    });
+  });
+
+  describe('LLMProvider Behavioral Isolation & API Key Masking (Part E)', () => {
+    it('verifies Alpha can read Alpha own LLMProvider including apiKey', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      await withTenantContext(alphaId, async (tx) => {
+        const rows = await tx.$queryRawUnsafe<Array<{ id: string; apiKey: string }>>(
+          `SELECT id, "apiKey" FROM public."LLMProvider" WHERE id = 'synth_alpha_llm_prov_01';`
+        );
+        expect(rows.length).toBe(1);
+        expect(rows[0].apiKey).toBe('sk-alpha-custom-key');
+      });
+    });
+
+    it('verifies Alpha cannot read or manipulate Beta LLMProvider or API keys', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      await withTenantContext(alphaId, async (tx) => {
+        const betaRows = await tx.$queryRawUnsafe<Array<{ id: string; apiKey: string }>>(
+          `SELECT id, "apiKey" FROM public."LLMProvider" WHERE id = 'synth_beta_llm_prov_01';`
+        );
+        expect(betaRows.length).toBe(0);
+
+        const updateCount = await tx.$executeRawUnsafe(
+          `UPDATE public."LLMProvider" SET "apiKey" = 'tampered_key' WHERE id = 'synth_beta_llm_prov_01';`
+        );
+        expect(updateCount).toBe(0);
+
+        const deleteCount = await tx.$executeRawUnsafe(
+          `DELETE FROM public."LLMProvider" WHERE id = 'synth_beta_llm_prov_01';`
+        );
+        expect(deleteCount).toBe(0);
+      });
+    });
+
+    it('verifies system default provider is visible only when apiKey is empty', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      await withTenantContext(alphaId, async (tx) => {
+        // System provider with empty key is readable
+        const sysEmpty = await tx.$queryRawUnsafe<Array<{ id: string; apiKey: string }>>(
+          `SELECT id, "apiKey" FROM public."LLMProvider" WHERE id = 'synth_sys_llm_prov_01';`
+        );
+        expect(sysEmpty.length).toBe(1);
+        expect(sysEmpty[0].apiKey).toBe('');
+
+        // System provider with non-empty key is completely hidden by RLS policy
+        const sysSecret = await tx.$queryRawUnsafe<Array<{ id: string; apiKey: string }>>(
+          `SELECT id, "apiKey" FROM public."LLMProvider" WHERE id = 'synth_sys_llm_prov_secret';`
+        );
+        expect(sysSecret.length).toBe(0);
+
+        // Alpha cannot update system provider (authorId is NULL)
+        const updateSys = await tx.$executeRawUnsafe(
+          `UPDATE public."LLMProvider" SET "apiKey" = 'tampered' WHERE id = 'synth_sys_llm_prov_01';`
+        );
+        expect(updateSys).toBe(0);
+      });
+    });
+  });
+
+  describe('OAuth2 Tables Behavioral Isolation (Part E)', () => {
+    it('verifies query without tenant context returns 0 OAuth2 clients, codes, and tokens', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      const clients = await prisma.$queryRawUnsafe<Array<{ id: string }>>('SELECT id FROM public."OAuth2Client";');
+      expect(clients.length).toBe(0);
+
+      const codes = await prisma.$queryRawUnsafe<Array<{ id: string }>>('SELECT id FROM public."OAuth2AuthorizationCode";');
+      expect(codes.length).toBe(0);
+
+      const tokens = await prisma.$queryRawUnsafe<Array<{ id: string }>>('SELECT id FROM public."OAuth2Token";');
+      expect(tokens.length).toBe(0);
+    });
+
+    it('verifies Alpha cannot read, update, or delete Beta OAuth2Client', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      await withTenantContext(alphaId, async (tx) => {
+        const betaClients = await tx.$queryRawUnsafe<Array<{ id: string }>>(
+          `SELECT id FROM public."OAuth2Client" WHERE id = 'synth_beta_oauth_client_01';`
+        );
+        expect(betaClients.length).toBe(0);
+
+        const updateCount = await tx.$executeRawUnsafe(
+          `UPDATE public."OAuth2Client" SET "client_metadata" = '{}' WHERE id = 'synth_beta_oauth_client_01';`
+        );
+        expect(updateCount).toBe(0);
+
+        // Alpha can read Alpha's own client
+        const alphaClients = await tx.$queryRawUnsafe<Array<{ id: string }>>(
+          `SELECT id FROM public."OAuth2Client" WHERE id = 'synth_alpha_oauth_client_01';`
+        );
+        expect(alphaClients.length).toBe(1);
+      });
+
+      // Separate transaction for negative insert check
+      await withTenantContext(alphaId, async (tx) => {
+        await expect(
+          tx.$executeRawUnsafe(`
+            INSERT INTO public."OAuth2Client" (id, "user_id", "client_id", "client_secret", "client_metadata")
+            VALUES ('spoofed_oauth_client', '${betaId}', 'spoofed_cid', 'spoofed_sec', '{}');
+          `)
+        ).rejects.toThrow();
+      });
+    });
+
+    it('verifies Alpha cannot read or insert Beta OAuth2AuthorizationCode', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      await withTenantContext(alphaId, async (tx) => {
+        const betaCodes = await tx.$queryRawUnsafe<Array<{ id: string; code: string }>>(
+          `SELECT id, code FROM public."OAuth2AuthorizationCode" WHERE id = 'synth_beta_auth_code_01';`
+        );
+        expect(betaCodes.length).toBe(0);
+
+        const alphaCodes = await tx.$queryRawUnsafe<Array<{ id: string }>>(
+          `SELECT id FROM public."OAuth2AuthorizationCode" WHERE id = 'synth_alpha_auth_code_01';`
+        );
+        expect(alphaCodes.length).toBe(1);
+      });
+
+      // Separate transaction for negative insert check
+      await withTenantContext(alphaId, async (tx) => {
+        await expect(
+          tx.$executeRawUnsafe(`
+            INSERT INTO public."OAuth2AuthorizationCode" (id, "user_id", "client_id", code, "response_type", "auth_time")
+            VALUES ('spoofed_code_01', '${betaId}', 'cid_beta_client_01', 'code_spoofed_123', 'code', 1700000000);
+          `)
+        ).rejects.toThrow();
+      });
+    });
+
+    it('verifies Alpha cannot read or insert Beta OAuth2Token', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      await withTenantContext(alphaId, async (tx) => {
+        const betaTokens = await tx.$queryRawUnsafe<Array<{ id: string; access_token: string }>>(
+          `SELECT id, "access_token" FROM public."OAuth2Token" WHERE id = 'synth_beta_token_01';`
+        );
+        expect(betaTokens.length).toBe(0);
+
+        const alphaTokens = await tx.$queryRawUnsafe<Array<{ id: string }>>(
+          `SELECT id FROM public."OAuth2Token" WHERE id = 'synth_alpha_token_01';`
+        );
+        expect(alphaTokens.length).toBe(1);
+      });
+
+      // Separate transaction for negative insert check
+      await withTenantContext(alphaId, async (tx) => {
+        await expect(
+          tx.$executeRawUnsafe(`
+            INSERT INTO public."OAuth2Token" (id, "user_id", "client_id", "token_type", "access_token", "issued_at")
+            VALUES ('spoofed_token_01', '${betaId}', 'cid_beta_client_01', 'Bearer', 'tok_spoofed_123', 1700000000);
+          `)
+        ).rejects.toThrow();
+      });
+    });
+  });
+
+  describe('Reddit Worker Tables Privilege Boundaries (Part E)', () => {
+    it('verifies medimate_app runtime role has zero access to RedditAccessToken', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      await expect(
+        prisma.$queryRawUnsafe('SELECT * FROM public."RedditAccessToken" LIMIT 1;')
+      ).rejects.toThrow(/permission denied/i);
+
+      await expect(
+        prisma.$executeRawUnsafe(`
+          INSERT INTO public."RedditAccessToken" (id, username, "accessToken", "tokenType", "expiresIn", scope, "expiresAt", "createdAt", "updatedAt")
+          VALUES ('probe', 'testuser', 'tok123', 'bearer', 3600, 'read', NOW(), NOW(), NOW());
+        `)
+      ).rejects.toThrow(/permission denied/i);
+    });
+
+    it('verifies medimate_app runtime role has zero access to RedditPost and RedditPostComment', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      await expect(
+        prisma.$queryRawUnsafe('SELECT * FROM public."RedditPost" LIMIT 1;')
+      ).rejects.toThrow(/permission denied/i);
+
+      await expect(
+        prisma.$executeRawUnsafe(`
+          INSERT INTO public."RedditPost" (id, "postId", title, content, "isMedicalAdviceRequired", "createdAt", "updatedAt")
+          VALUES ('probe', 'pid_probe', 'title', 'content', true, NOW(), NOW());
+        `)
+      ).rejects.toThrow(/permission denied/i);
+
+      await expect(
+        prisma.$queryRawUnsafe('SELECT * FROM public."RedditPostComment" LIMIT 1;')
+      ).rejects.toThrow(/permission denied/i);
+
+      await expect(
+        prisma.$executeRawUnsafe(`
+          INSERT INTO public."RedditPostComment" (id, "postId", "commentId", "assistantModeId", content, "createdAt", "updatedAt")
+          VALUES ('probe', 'pid_probe', 'cid_probe', 'aid_probe', 'content', NOW(), NOW());
+        `)
+      ).rejects.toThrow(/permission denied/i);
+    });
+
+    it('verifies medimate_reddit_worker has exclusive grants in information_schema table_privileges', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      // Check PostgreSQL privilege function has_table_privilege
+      const privs = await prisma.$queryRawUnsafe<Array<{
+        worker_token: boolean;
+        worker_post: boolean;
+        worker_comment: boolean;
+        app_token: boolean;
+        app_post: boolean;
+        app_comment: boolean;
+      }>>(`
+        SELECT 
+          has_table_privilege('medimate_reddit_worker', 'public."RedditAccessToken"', 'SELECT') as worker_token,
+          has_table_privilege('medimate_reddit_worker', 'public."RedditPost"', 'SELECT') as worker_post,
+          has_table_privilege('medimate_reddit_worker', 'public."RedditPostComment"', 'SELECT') as worker_comment,
+          has_table_privilege('medimate_app', 'public."RedditAccessToken"', 'SELECT') as app_token,
+          has_table_privilege('medimate_app', 'public."RedditPost"', 'SELECT') as app_post,
+          has_table_privilege('medimate_app', 'public."RedditPostComment"', 'SELECT') as app_comment;
+      `);
+
+      expect(privs.length).toBe(1);
+      expect(privs[0].worker_token).toBe(true);
+      expect(privs[0].worker_post).toBe(true);
+      expect(privs[0].worker_comment).toBe(true);
+      expect(privs[0].app_token).toBe(false);
+      expect(privs[0].app_post).toBe(false);
+      expect(privs[0].app_comment).toBe(false);
+    });
+  });
+
+  describe('Session Hygiene, Rollback & Connection Pool Safety', () => {
     it('verifies transaction-local tenant context is cleared after commit and rollback', async (ctx) => {
       if (!isPostgresLive) {
         ctx.skip();
@@ -449,23 +1188,23 @@ describe('PostgreSQL Live Authentication, RLS & Role Privilege Verification (Che
       }
 
       const { PrismaClient } = await import('@prisma/client');
-      const ownerPrisma = new PrismaClient({
+      const testOwnerPrisma = new PrismaClient({
         datasources: { db: { url: migrationUrl } },
       });
 
       try {
         // Strict verification must succeed without error for migration owner
         await expect(
-          ownerPrisma.$executeRawUnsafe('SELECT public.apply_medimate_rls_policies(true);')
+          testOwnerPrisma.$executeRawUnsafe('SELECT public.apply_medimate_rls_policies(true);')
         ).resolves.toBeDefined();
 
         // Migration owner can query _prisma_migrations
-        const migrationRows = await ownerPrisma.$queryRawUnsafe<Array<unknown>>(
+        const migrationRows = await testOwnerPrisma.$queryRawUnsafe<Array<unknown>>(
           'SELECT * FROM public._prisma_migrations LIMIT 1;'
         );
         expect(Array.isArray(migrationRows)).toBe(true);
       } finally {
-        await ownerPrisma.$disconnect();
+        await testOwnerPrisma.$disconnect();
       }
     });
   });

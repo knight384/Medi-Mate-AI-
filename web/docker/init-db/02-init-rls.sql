@@ -89,6 +89,19 @@ BEGIN
         EXECUTE format('ALTER TABLE public.%I FORCE ROW LEVEL SECURITY', r.tablename);
     END LOOP;
 
+    -- Migration owner operational policy: Ensure schema owner (medimate_owner) retains full management access for migrations and maintenance
+    IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_owner') THEN
+        FOR r IN (
+            SELECT tablename
+            FROM pg_catalog.pg_tables
+            WHERE schemaname = 'public'
+              AND tablename NOT IN ('_prisma_migrations')
+        ) LOOP
+            EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', r.tablename || '_owner_all', r.tablename);
+            EXECUTE format('CREATE POLICY %I ON public.%I FOR ALL TO medimate_owner USING (true) WITH CHECK (true)', r.tablename || '_owner_all', r.tablename);
+        END LOOP;
+    END IF;
+
     -- Task I: Ensure _prisma_migrations is completely excluded from RLS and inaccessible to medimate_app
     IF EXISTS (SELECT FROM pg_catalog.pg_tables WHERE schemaname = 'public' AND tablename = '_prisma_migrations') THEN
         EXECUTE 'REVOKE ALL ON TABLE public._prisma_migrations FROM PUBLIC';

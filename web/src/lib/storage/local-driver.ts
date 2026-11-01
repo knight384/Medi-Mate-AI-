@@ -32,16 +32,108 @@ export class StorageSecurityError extends AppError {
   }
 }
 
-// Magic bytes identifier for authenticated AES-256-GCM encrypted document container
-const MAGIC_HEADER = Buffer.from('MM_ENC02'); // 8 bytes
-const HEADER_SIZE = 36; // 8 bytes magic + 12 bytes nonce + 16 bytes auth tag
+/**
+ * Container Header Formats & Constants:
+ *
+ * MM_ENC03 (Modern, 40 bytes):
+ * - Bytes 0..7:   Magic ASCII "MM_ENC03" (8 bytes)
+ * - Bytes 8..11:  Key Identifier (4 bytes ASCII, e.g. "k001")
+ * - Bytes 12..23: Nonce / IV (12 bytes)
+ * - Bytes 24..39: GCM Authentication Tag (16 bytes)
+ * - Offset 40+:   AES-256-GCM Ciphertext payload
+ *
+ * MM_ENC02 (Backward Compatible, 36 bytes):
+ * - Bytes 0..7:   Magic ASCII "MM_ENC02" (8 bytes)
+ * - Bytes 8..19:  Nonce / IV (12 bytes)
+ * - Bytes 20..35: GCM Authentication Tag (16 bytes)
+ * - Offset 36+:   AES-256-GCM Ciphertext payload (defaults to primary key "k001")
+ *
+ * Cryptographic Nonce & Key Lifecycle Notice (NIST SP 800-38D Section 8.2.2):
+ * A 96-bit random nonce does NOT guarantee collision-free uniqueness across infinite invocations.
+ * Under birthday paradox bounds, collision probability P is bounded by q^2 / 2^97.
+ * NIST SP 800-38D mandates that total invocations under a single key SHALL NOT exceed 2^32,
+ * bounding collision probability below 2^-32 (~2.33e-10).
+ * Operational recommendation: Rotate master encryption keys every 2^24 encryptions or 90 days.
+ */
+export const MAGIC_HEADER_V2 = Buffer.from('MM_ENC02'); // 8 bytes
+export const MAGIC_HEADER_V3 = Buffer.from('MM_ENC03'); // 8 bytes
+export const HEADER_SIZE_V2 = 36;
+export const HEADER_SIZE_V3 = 40;
+export const DEFAULT_KEY_ID = 'k001';
+
+export interface LocalStorageDriverOptions {
+  customStorageDir?: string;
+  keyring?: Map<string, Buffer>;
+  activeKeyId?: string;
+}
+
+export interface WriteStreamOptions {
+  version?: 'MM_ENC02' | 'MM_ENC03';
+  keyId?: string;
+}
 
 export class LocalStorageDriver {
   private readonly customStorageDir?: string;
+  private readonly keyring: Map<string, Buffer>;
+  private readonly activeKeyId: string;
 
-  constructor(customStorageDir?: string) {
+  constructor(
+    optionsOrDir?: string | LocalStorageDriverOptions,
+    keyringArg?: Map<string, Buffer>,
+    activeKeyIdArg = DEFAULT_KEY_ID
+  ) {
+    let customStorageDir: string | undefined;
+    if (typeof optionsOrDir === 'string') {
+      customStorageDir = optionsOrDir;
+      this.keyring = keyringArg ? new Map(keyringArg) : new Map();
+      this.activeKeyId = activeKeyIdArg;
+    } else if (optionsOrDir && typeof optionsOrDir === 'object') {
+      customStorageDir = optionsOrDir.customStorageDir;
+      this.keyring = optionsOrDir.keyring ? new Map(optionsOrDir.keyring) : new Map();
+      this.activeKeyId = optionsOrDir.activeKeyId || DEFAULT_KEY_ID;
+    } else {
+      this.keyring = new Map();
+      this.activeKeyId = DEFAULT_KEY_ID;
+    }
+
+    // Ensure active key is populated in keyring
+    if (!this.keyring.has(this.activeKeyId)) {
+      try {
+        this.keyring.set(this.activeKeyId, getEncryptionKey());
+      } catch {
+        // In build or test contexts where key might be lazily provided
+      }
+    }
+
     this.customStorageDir = customStorageDir;
     this.validateRoot(this.getStorageRoot());
+  }
+
+  /**
+   * Retrieves an encryption key from keyring by identifier.
+   */
+  public getKey(keyId: string): Buffer {
+    const trimmedId = keyId.trim();
+    let key = this.keyring.get(trimmedId);
+    if (!key && (trimmedId === DEFAULT_KEY_ID || trimmedId === '')) {
+      key = getEncryptionKey();
+      this.keyring.set(DEFAULT_KEY_ID, key);
+    }
+    if (!key) {
+      throw new StorageSecurityError(`Unknown encryption key identifier: ${trimmedId}`);
+    }
+    return key;
+  }
+
+  public getActiveKeyId(): string {
+    return this.activeKeyId;
+  }
+
+  public registerKey(keyId: string, key: Buffer): void {
+    if (key.length !== 32) {
+      throw new StorageSecurityError(`Invalid encryption key length: expected 32 bytes, got ${key.length}`);
+    }
+    this.keyring.set(keyId.trim(), key);
   }
 
   private validateRoot(root: string): void {
@@ -101,22 +193,69 @@ export class LocalStorageDriver {
   }
 
   /**
-   * Initializes storage directories with restrictive permissions (0700).
+   * Scrubs orphaned temporary files (> maxAgeMs old) resulting from process crashes or ungraceful terminations.
+   * Active temporary files (< maxAgeMs) are untouched, avoiding race conditions with concurrent workers.
+   *
+   * @param maxAgeMs Maximum age in milliseconds (defaults to 15 minutes = 900,000 ms)
+   * @returns Number of orphaned temporary files deleted
+   */
+  public async cleanupOrphanedTempFiles(maxAgeMs: number = 15 * 60 * 1000): Promise<number> {
+    try {
+      const entries = await fsp.readdir(this.tempDir, { withFileTypes: true });
+      const now = Date.now();
+      let cleanedCount = 0;
+
+      for (const entry of entries) {
+        if (entry.isFile() && (entry.name.endsWith('.tmp') || entry.name.includes('.quarantine'))) {
+          const fullPath = path.join(this.tempDir, entry.name);
+          try {
+            const stat = await fsp.stat(fullPath);
+            if (now - stat.mtimeMs > maxAgeMs) {
+              await fsp.unlink(fullPath);
+              cleanedCount++;
+              logger.info('Cleaned up orphaned temporary storage file', {
+                file: entry.name,
+                ageMs: now - stat.mtimeMs,
+              });
+            }
+          } catch {
+            // Concurrently unlinked or inaccessible
+          }
+        }
+      }
+      return cleanedCount;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        return 0;
+      }
+      logger.warn('Failed to clean up orphaned temporary files in storage', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return 0;
+    }
+  }
+
+  /**
+   * Initializes storage directories with restrictive permissions (0700) and purges stale temp files.
    */
   public async init(): Promise<void> {
     await fsp.mkdir(this.storageRoot, { recursive: true, mode: 0o700 });
     await fsp.mkdir(this.tempDir, { recursive: true, mode: 0o700 });
+    await this.cleanupOrphanedTempFiles();
   }
 
   /**
    * Writes a stream to private storage atomically using authenticated AES-256-GCM encryption at rest.
-   * Stored format: [8-byte MAGIC "MM_ENC02"] + [12-byte Nonce] + [16-byte AuthTag] + [Ciphertext]
+   * Default stored format (MM_ENC03):
+   * [8-byte MAGIC "MM_ENC03"] + [4-byte KeyId] + [12-byte Nonce] + [16-byte AuthTag] + [Ciphertext]
+   *
    * Decouples client filenames, enforces boundary checks, and ensures no plaintext is ever written to disk.
    */
   public async writeStream(
     storageKey: string,
     sourceStream: Readable | NodeJS.ReadableStream | ReadableStream<Uint8Array>,
-    maxBytes?: number
+    maxBytes?: number,
+    options?: WriteStreamOptions
   ): Promise<StoredObjectMetadata> {
     if (process.env.NODE_ENV === 'production' && !this.isExplicitlyConfigured()) {
       throw new StorageSecurityError(
@@ -137,19 +276,41 @@ export class LocalStorageDriver {
     const tempFileName = `${crypto.randomUUID()}.tmp`;
     const tempFilePath = path.join(this.tempDir, tempFileName);
 
-    // Cryptographic initialization
-    const key = getEncryptionKey();
+    const version = options?.version || 'MM_ENC03';
+    const keyId = (options?.keyId || this.activeKeyId).padEnd(4, ' ').slice(0, 4);
+    const key = this.getKey(keyId);
+
+    // Cryptographic initialization (NIST SP 800-38D: 12-byte nonce)
     const nonce = crypto.randomBytes(12);
     const cipher = crypto.createCipheriv('aes-256-gcm', key, nonce);
     // Bind storage key as AAD to prevent document swapping/relocation attacks
     cipher.setAAD(Buffer.from(storageKey, 'utf8'));
 
-    // Write header placeholder: MAGIC (8) + Nonce (12) + AuthTag placeholder (16)
-    const headerPlaceholder = Buffer.concat([
-      MAGIC_HEADER,
-      nonce,
-      Buffer.alloc(16), // Placeholder for 16-byte GCM auth tag
-    ]);
+    // Construct header placeholder
+    let headerPlaceholder: Buffer;
+    let tagOffset: number;
+
+    if (version === 'MM_ENC02') {
+      // Legacy V2 container: 8 bytes magic + 12 bytes nonce + 16 bytes tag placeholder
+      headerPlaceholder = Buffer.concat([
+        MAGIC_HEADER_V2,
+        nonce,
+        Buffer.alloc(16),
+      ]);
+      tagOffset = 20;
+    } else {
+      // Modern V3 container: 8 bytes magic + 4 bytes keyId + 12 bytes nonce + 16 bytes tag placeholder
+      const keyIdBuf = Buffer.alloc(4);
+      keyIdBuf.write(keyId, 0, 4, 'ascii');
+      headerPlaceholder = Buffer.concat([
+        MAGIC_HEADER_V3,
+        keyIdBuf,
+        nonce,
+        Buffer.alloc(16),
+      ]);
+      tagOffset = 24;
+    }
+
     await fsp.writeFile(tempFilePath, headerPlaceholder, { mode: 0o600, flag: 'wx' });
 
     let bytesWritten = 0;
@@ -199,11 +360,11 @@ export class LocalStorageDriver {
     try {
       await pipeline(nodeReadable, encryptTransform, writeCipherStream);
 
-      // Extract authentication tag and patch it into header at offset 20
+      // Extract authentication tag and patch it into header at designated offset
       const authTag = cipher.getAuthTag();
       const fileHandle = await fsp.open(tempFilePath, 'r+');
       try {
-        await fileHandle.write(authTag, 0, 16, 20);
+        await fileHandle.write(authTag, 0, 16, tagOffset);
         await fileHandle.sync();
       } finally {
         await fileHandle.close();
@@ -249,8 +410,16 @@ export class LocalStorageDriver {
   }
 
   /**
-   * Reads an existing private document stream, authenticating and decrypting AES-256-GCM ciphertext on the fly.
-   * Backward-compatible with legacy unencrypted objects during migration.
+   * Reads an existing private document stream, authenticating and decrypting AES-256-GCM ciphertext.
+   *
+   * SECURITY DIRECTIVE (Zero Plaintext Invariant):
+   * Node.js decipher.update() emits chunks before decipher.final() verifies the authentication tag.
+   * To prevent unauthenticated plaintext from reaching HTTP responses, callers, or parsers,
+   * this method decrypts into a private quarantine file (.tmp/<id>.quarantine.tmp, mode 0600)
+   * and verifies decipher.final() to completion. Only if authentication succeeds is a verified stream
+   * returned, with automated unlink on stream closure.
+   *
+   * Unauthenticated or headerless legacy files are rejected with StorageSecurityError.
    */
   public async readStream(storageKey: string): Promise<StorageReadResult> {
     const targetPath = this.resolveSecurePath(storageKey);
@@ -281,52 +450,100 @@ export class LocalStorageDriver {
 
     const mimeType = guessMime(realPath);
 
-    // Read header to check for authenticated encrypted container
-    if (stat.size >= HEADER_SIZE) {
-      const headerBuf = Buffer.alloc(HEADER_SIZE);
-      const fh = await fsp.open(realPath, 'r');
-      let bytesRead = 0;
-      try {
-        const res = await fh.read(headerBuf, 0, HEADER_SIZE, 0);
-        bytesRead = res.bytesRead;
-      } finally {
-        await fh.close();
-      }
-
-      if (bytesRead >= HEADER_SIZE && headerBuf.subarray(0, 8).equals(MAGIC_HEADER)) {
-        const nonce = headerBuf.subarray(8, 20);
-        const authTag = headerBuf.subarray(20, 36);
-
-        const key = getEncryptionKey();
-        const decipher = crypto.createDecipheriv('aes-256-gcm', key, nonce);
-        decipher.setAAD(Buffer.from(storageKey, 'utf8'));
-        decipher.setAuthTag(authTag);
-
-        const cipherStream = fs.createReadStream(realPath, { start: HEADER_SIZE });
-        const decryptedStream = cipherStream.pipe(decipher);
-
-        return {
-          stream: decryptedStream,
-          size: stat.size - HEADER_SIZE,
-          mimeType,
-          isEncrypted: true,
-        };
-      }
+    // Validate container header
+    if (stat.size < HEADER_SIZE_V2) {
+      throw new StorageSecurityError(
+        'Legacy plaintext or unauthenticated document format rejected in standard pipeline'
+      );
     }
 
-    // Legacy unencrypted stream backward compatibility
-    const stream = fs.createReadStream(realPath);
+    const maxHeaderBuf = Buffer.alloc(HEADER_SIZE_V3);
+    const fh = await fsp.open(realPath, 'r');
+    let bytesRead = 0;
+    try {
+      const res = await fh.read(maxHeaderBuf, 0, HEADER_SIZE_V3, 0);
+      bytesRead = res.bytesRead;
+    } finally {
+      await fh.close();
+    }
+
+    let keyId = DEFAULT_KEY_ID;
+    let nonce: Buffer;
+    let authTag: Buffer;
+    let cipherStartOffset: number;
+
+    if (bytesRead >= HEADER_SIZE_V3 && maxHeaderBuf.subarray(0, 8).equals(MAGIC_HEADER_V3)) {
+      // Modern MM_ENC03 container
+      keyId = maxHeaderBuf.subarray(8, 12).toString('ascii').trim();
+      nonce = maxHeaderBuf.subarray(12, 24);
+      authTag = maxHeaderBuf.subarray(24, 40);
+      cipherStartOffset = HEADER_SIZE_V3;
+    } else if (bytesRead >= HEADER_SIZE_V2 && maxHeaderBuf.subarray(0, 8).equals(MAGIC_HEADER_V2)) {
+      // Backward-compatible MM_ENC02 container
+      keyId = DEFAULT_KEY_ID;
+      nonce = maxHeaderBuf.subarray(8, 20);
+      authTag = maxHeaderBuf.subarray(20, 36);
+      cipherStartOffset = HEADER_SIZE_V2;
+    } else {
+      // Rejection of unauthenticated / headerless legacy files in production
+      throw new StorageSecurityError(
+        'Legacy plaintext or unauthenticated document format rejected in standard pipeline'
+      );
+    }
+
+    const key = this.getKey(keyId);
+    await this.init();
+
+    // Quarantine Decryption: decrypt completely into private temporary quarantine file
+    const quarantineFileName = `${crypto.randomUUID()}.quarantine.tmp`;
+    const quarantinePath = path.join(this.tempDir, quarantineFileName);
+
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, nonce);
+    decipher.setAAD(Buffer.from(storageKey, 'utf8'));
+    decipher.setAuthTag(authTag);
+
+    const cipherStream = fs.createReadStream(realPath, { start: cipherStartOffset });
+    const quarantineWriteStream = fs.createWriteStream(quarantinePath, {
+      flags: 'wx',
+      mode: 0o600,
+    });
+
+    try {
+      await pipeline(cipherStream, decipher, quarantineWriteStream);
+    } catch (pipelineErr) {
+      // Immediately purge quarantine file on any authentication error
+      await fsp.unlink(quarantinePath).catch(() => {});
+      throw new StorageSecurityError(
+        `Cryptographic authentication failed: document ciphertext on disk has been tampered with or corrupted (${(pipelineErr as Error).message})`
+      );
+    }
+
+    // Authentication succeeded! Stat the verified quarantine file for exact size
+    const qStat = await fsp.stat(quarantinePath);
+    const verifiedStream = fs.createReadStream(quarantinePath);
+
+    // Automatic cleanup of quarantine file once stream finishes or errors
+    let unlinked = false;
+    const cleanupQuarantine = () => {
+      if (!unlinked) {
+        unlinked = true;
+        fsp.unlink(quarantinePath).catch(() => {});
+      }
+    };
+    verifiedStream.on('close', cleanupQuarantine);
+    verifiedStream.on('error', cleanupQuarantine);
+
     return {
-      stream,
-      size: stat.size,
+      stream: verifiedStream,
+      size: qStat.size,
       mimeType,
-      isEncrypted: false,
+      isEncrypted: true,
     };
   }
 
   /**
    * Reads and decrypts an entire document into memory as a plaintext Buffer.
-   * Verifies GCM authentication tag before resolving.
+   * Strictly enforces GCM authentication verification before resolving.
    */
   public async readBuffer(storageKey: string): Promise<Buffer> {
     const { stream } = await this.readStream(storageKey);
@@ -335,13 +552,7 @@ export class LocalStorageDriver {
     return new Promise((resolve, reject) => {
       stream.on('data', (chunk: Buffer) => chunks.push(chunk));
       stream.on('end', () => resolve(Buffer.concat(chunks)));
-      stream.on('error', (err: Error) => {
-        reject(
-          new StorageSecurityError(
-            `Cryptographic authentication failed: document ciphertext on disk has been tampered with or corrupted (${err.message})`
-          )
-        );
-      });
+      stream.on('error', (err: Error) => reject(err));
     });
   }
 
@@ -349,6 +560,8 @@ export class LocalStorageDriver {
    * Decrypts document stream to a short-lived temporary file with restrictive permissions (0600)
    * within private storage .tmp directory, executes the provided worker callback, and cleans up
    * the temporary plaintext file deterministically in a finally block.
+   *
+   * Plaintext file is ONLY created and passed to fn after GCM authentication completes successfully.
    */
   public async withDecryptedTempFile<T>(
     storageKey: string,
@@ -368,12 +581,49 @@ export class LocalStorageDriver {
       await pipeline(stream, writeStream);
       return await fn(tempPlaintextPath);
     } finally {
-      try {
-        await fsp.unlink(tempPlaintextPath);
-      } catch {
-        // Ignore deletion error if file does not exist
-      }
+      await fsp.unlink(tempPlaintextPath).catch(() => {});
     }
+  }
+
+  /**
+   * Dedicated isolated legacy document reader strictly for the migration utility.
+   * Standard production pipelines reject unauthenticated legacy documents.
+   */
+  public async readLegacyDocumentForMigration(storageKey: string): Promise<StorageReadResult> {
+    const targetPath = this.resolveSecurePath(storageKey);
+
+    let stat: fs.Stats;
+    try {
+      stat = await fsp.stat(targetPath);
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        throw new NotFoundError('Storage document not found');
+      }
+      throw err;
+    }
+
+    if (!stat.isFile()) {
+      throw new StorageSecurityError('Requested storage resource is not a regular file');
+    }
+
+    const realPath = await fsp.realpath(targetPath);
+    const rootWithSep = this.storageRoot.endsWith(path.sep)
+      ? this.storageRoot
+      : this.storageRoot + path.sep;
+
+    if (!realPath.startsWith(rootWithSep)) {
+      throw new StorageSecurityError('Symlink destination outside storage root blocked');
+    }
+
+    logger.warn('Reading unauthenticated legacy document for migration', { storageKey });
+    const mimeType = guessMime(realPath);
+
+    return {
+      stream: fs.createReadStream(realPath),
+      size: stat.size,
+      mimeType,
+      isEncrypted: false,
+    };
   }
 
   /**

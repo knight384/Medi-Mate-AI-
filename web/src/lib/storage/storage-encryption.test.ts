@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { Readable } from 'node:stream';
-import { LocalStorageDriver } from './local-driver';
+import { LocalStorageDriver, StorageSecurityError } from './local-driver';
 import { generateStorageKey } from './naming';
 
 describe('Part C — Medical Document Bytes-at-Rest Encryption & Authenticity Verification', () => {
@@ -44,12 +44,12 @@ describe('Part C — Medical Document Bytes-at-Rest Encryption & Authenticity Ve
     const diskPath = await driver.getValidatedDiskPath(storageKey);
     const rawDiskBytes = await fsp.readFile(diskPath);
 
-    // 1. Magic bytes header check: MUST start with MM_ENC02
+    // 1. Magic bytes header check: MUST start with MM_ENC03 (Checkpoint 5D.24 container version)
     const magic = rawDiskBytes.subarray(0, 8).toString('utf8');
-    expect(magic).toBe('MM_ENC02');
+    expect(magic).toBe('MM_ENC03');
 
-    // 2. Physical file size MUST be 36 bytes larger than plaintext (8 header + 12 nonce + 16 tag)
-    expect(rawDiskBytes.length).toBe(syntheticMedicalPdf.length + 36);
+    // 2. Physical file size MUST be 40 bytes larger than plaintext (8 magic + 4 keyId + 12 nonce + 16 tag)
+    expect(rawDiskBytes.length).toBe(syntheticMedicalPdf.length + 40);
 
     // 3. CRITICAL: Plaintext PDF headers and medical text MUST NEVER appear in raw disk bytes
     const rawDiskString = rawDiskBytes.toString('binary');
@@ -176,16 +176,20 @@ describe('Part C — Medical Document Bytes-at-Rest Encryption & Authenticity Ve
     await expect(driver.readBuffer(keyB)).rejects.toThrow(/Cryptographic authentication failed/);
   });
 
-  it('maintains backward compatibility with pre-existing unencrypted documents', async () => {
+  it('rejects unencrypted legacy documents in production readStream but allows readLegacyDocumentForMigration', async () => {
     const storageKey = generateStorageKey('legacy_patient', '.pdf');
     const legacyPlaintext = Buffer.from('%PDF-1.3 Legacy Unencrypted Document from Before 5D.23');
 
-    // Write file directly without MM_ENC02 header (simulating pre-existing disk state)
+    // Write file directly without container header (simulating historical pre-encryption disk state)
     const securePath = driver.resolveSecurePath(storageKey);
     await fsp.mkdir(path.dirname(securePath), { recursive: true });
     await fsp.writeFile(securePath, legacyPlaintext);
 
-    const { stream, size, isEncrypted } = await driver.readStream(storageKey);
+    // Standard production readStream rejects unauthenticated legacy file
+    await expect(driver.readStream(storageKey)).rejects.toThrow(StorageSecurityError);
+
+    // Dedicated migration utility reader successfully reads legacy document
+    const { stream, size, isEncrypted } = await driver.readLegacyDocumentForMigration(storageKey);
     expect(isEncrypted).toBe(false);
     expect(size).toBe(legacyPlaintext.length);
 
@@ -194,5 +198,30 @@ describe('Part C — Medical Document Bytes-at-Rest Encryption & Authenticity Ve
       chunks.push(Buffer.from(chunk));
     }
     expect(Buffer.concat(chunks).equals(legacyPlaintext)).toBe(true);
+  });
+
+  it('maintains full backward-compatible decryption for MM_ENC02 legacy encrypted documents', async () => {
+    const storageKey = generateStorageKey('v2_patient', '.pdf');
+    const content = Buffer.from('%PDF-1.5 Confidential Patient Record in MM_ENC02 format');
+
+    // Write file explicitly using MM_ENC02 container version
+    await driver.writeStream(storageKey, Readable.from(content), undefined, { version: 'MM_ENC02' });
+
+    // Verify physical header is MM_ENC02 and size is content + 36
+    const diskPath = await driver.getValidatedDiskPath(storageKey);
+    const rawBytes = await fsp.readFile(diskPath);
+    expect(rawBytes.subarray(0, 8).toString('utf8')).toBe('MM_ENC02');
+    expect(rawBytes.length).toBe(content.length + 36);
+
+    // Read via standard readStream and verify transparent decryption
+    const { stream, size, isEncrypted } = await driver.readStream(storageKey);
+    expect(isEncrypted).toBe(true);
+    expect(size).toBe(content.length);
+
+    const chunks: Buffer[] = [];
+    for await (const chunk of stream) {
+      chunks.push(Buffer.from(chunk));
+    }
+    expect(Buffer.concat(chunks).equals(content)).toBe(true);
   });
 });

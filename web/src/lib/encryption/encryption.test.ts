@@ -215,6 +215,16 @@ describe('Encryption Engine & Authenticated AES-256-GCM Architecture (src/lib/en
       }).toThrow(/Legacy decryption failed during migration/);
     });
 
+    it('enforces format validation on legacy CBC decryption and rejects binary garbage or control characters', () => {
+      // Craft a legacy CBC ciphertext containing null / unprintable control bytes (simulating bit-flipped tampering)
+      const garbageSecret = 'sk-leg\x00\x01\x1Fbinary-corruption';
+      const garbageCbc = encryptLegacyCBC(garbageSecret, false);
+
+      expect(() => {
+        migrateCiphertextString(garbageCbc);
+      }).toThrow(/Decrypted legacy secret failed format validation/);
+    });
+
     it('executes batch migration over simulated LLMProvider database records with backup ledger', async () => {
       const rawKey1 = 'sk-provider-1-alpha';
       const rawKey2 = 'sk-provider-2-beta';

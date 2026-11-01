@@ -28,11 +28,20 @@ export class CiphertextMigrationError extends Error {
 }
 
 /**
- * Safely migrates an individual encrypted string from legacy CBC (or v1) to authenticated AES-256-GCM (v2).
- * Verifies round-trip integrity before returning the migrated ciphertext.
+ * Ciphertext Migration Utility
  *
- * @param ciphertext - The raw or versioned ciphertext.
- * @param aad - Optional Additional Authenticated Data to bind during re-encryption.
+ * Facilitates safe, audited migration of legacy unauthenticated AES-256-CBC ciphertexts
+ * to authenticated AES-256-GCM ciphertexts (v2).
+ *
+ * Cryptographic Note on Legacy CBC:
+ * Historical AES-256-CBC encryption without an HMAC or MAC lacks cryptographic integrity
+ * and authenticity guarantees. An attacker with write access to the database could flip bits
+ * in ciphertext blocks or forge padding without detection by the cipher itself.
+ * Therefore, during migration from legacy CBC, decrypted secrets MUST undergo format
+ * validation (e.g. verifying valid printable UTF-8 without control/null bytes) before
+ * re-encrypting under AES-256-GCM.
+ *
+ * Security Invariant: Plaintext secrets MUST NEVER be logged or leaked in error messages.
  */
 export function migrateCiphertextString(
   ciphertext: string,
@@ -65,10 +74,28 @@ export function migrateCiphertextString(
     );
   }
 
-  // 2. Re-encrypt with modern authenticated AES-256-GCM
+  // 2. Format validation: Legacy CBC lacks cryptographic authenticity (no MAC).
+  // Verify decrypted secret contains valid printable characters without null bytes or binary corruption.
+  // Never include secret plaintext in error messages.
+  if (!plaintext || plaintext.length === 0) {
+    throw new EncryptionError(
+      'Decrypted legacy secret is empty; cannot migrate invalid secret',
+      'INVALID_SECRET_FORMAT'
+    );
+  }
+
+  const hasUnprintable = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/.test(plaintext);
+  if (hasUnprintable) {
+    throw new EncryptionError(
+      'Decrypted legacy secret failed format validation (contains binary control characters); potentially corrupted or tampered historical CBC ciphertext',
+      'INVALID_SECRET_FORMAT'
+    );
+  }
+
+  // 3. Re-encrypt with modern authenticated AES-256-GCM
   const newCiphertext = encrypt(plaintext, aad);
 
-  // 3. Round-trip integrity verification before committing
+  // 4. Round-trip integrity verification before committing
   let verifiedPlaintext: string;
   try {
     verifiedPlaintext = decrypt(newCiphertext, aad);

@@ -1,5 +1,21 @@
 import crypto from 'node:crypto';
 
+/**
+ * ARCHITECTURAL BOUNDARY SPECIFICATION (Part H):
+ *
+ * 1. LocalSyntheticKMSAdapter & Envelope Encryption:
+ *    - Emulates cloud envelope encryption patterns (KMS DEK generation and wrapping with KEK).
+ *    - Standalone cryptographic utility designed for future cloud HSM/KMS migrations.
+ *    - Does NOT directly back LocalStorageDriver; LocalStorageDriver uses symmetric streaming
+ *      AES-256-GCM containers (MM_ENC03/MM_ENC02) with internal keyring mapping for low-latency
+ *      local file I/O.
+ *
+ * 2. Managed Cloud KMS (AWS KMS / GCP Cloud KMS):
+ *    - Class: CloudKMSClient
+ *    - Status: BLOCKED. Managed cloud KMS integrations require cloud IAM credentials,
+ *      service account keys, and outbound VPC/HTTPS endpoints not available in local/sandbox environments.
+ */
+
 export interface DataKeyResult {
   plaintextKey: Buffer;
   encryptedKeyCiphertext: string;

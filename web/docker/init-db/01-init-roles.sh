@@ -60,8 +60,9 @@ BEGIN
         ALTER ROLE medimate_reddit_worker WITH NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
     END IF;
 
-    -- 2. Grant database and schema ownership and DDL permissions to the owner role
-    EXECUTE format('GRANT ALL ON DATABASE %I TO %I', v_target_db, v_owner_user);
+    -- 2. Grant database access and schema ownership to the owner role (least-privilege: NO database CREATE)
+    EXECUTE format('GRANT CONNECT, TEMPORARY ON DATABASE %I TO %I', v_target_db, v_owner_user);
+    EXECUTE format('REVOKE CREATE ON DATABASE %I FROM %I', v_target_db, v_owner_user);
     EXECUTE format('ALTER SCHEMA public OWNER TO %I', v_owner_user);
     EXECUTE format('GRANT ALL ON SCHEMA public TO %I', v_owner_user);
 

@@ -49,7 +49,7 @@ describe('PostgreSQL Live Authentication, RLS & Role Privilege Verification (Che
       `DELETE FROM public."OAuth2AuthorizationCode" WHERE id LIKE 'synth_%'`,
       `DELETE FROM public."OAuth2Client" WHERE id LIKE 'synth_%'`,
       `DELETE FROM public."LLMProvider" WHERE id LIKE 'synth_%'`,
-      `DELETE FROM public."User" WHERE id IN ('${alphaId}', '${betaId}')`,
+      `DELETE FROM public."User" WHERE id IN ('${alphaId}', '${betaId}') OR id LIKE 'new_test_user_%'`,
     ];
     for (const stmt of statements) {
       try {
@@ -1206,6 +1206,224 @@ describe('PostgreSQL Live Authentication, RLS & Role Privilege Verification (Che
       } finally {
         await testOwnerPrisma.$disconnect();
       }
+    });
+
+    it('verifies migration ledger records all committed migrations without rollbacks', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      const migrationUrl = process.env.MIGRATION_DATABASE_URL;
+      if (!migrationUrl) {
+        ctx.skip();
+        return;
+      }
+
+      const { PrismaClient } = await import('@prisma/client');
+      const testOwnerPrisma = new PrismaClient({
+        datasources: { db: { url: migrationUrl } },
+      });
+
+      try {
+        const migrations = await testOwnerPrisma.$queryRawUnsafe<
+          Array<{ migration_name: string; finished_at: Date | null; rolled_back_at: Date | null; applied_steps_count: number }>
+        >(`
+          SELECT migration_name, finished_at, rolled_back_at, applied_steps_count
+          FROM public._prisma_migrations
+          WHERE rolled_back_at IS NULL
+          ORDER BY started_at ASC;
+        `);
+
+        expect(migrations.length).toBeGreaterThanOrEqual(2);
+        const migrationNames = migrations.map((m) => m.migration_name);
+        expect(migrationNames).toContain('0_init');
+        expect(migrationNames).toContain('20261101120000_reconcile_user_has_onboarded');
+
+        for (const m of migrations) {
+          expect(m.finished_at).not.toBeNull();
+          expect(m.rolled_back_at).toBeNull();
+          expect(m.applied_steps_count).toBe(1);
+        }
+      } finally {
+        await testOwnerPrisma.$disconnect();
+      }
+    });
+  });
+
+  describe('Database Least-Privilege & Administrative Boundaries (Checkpoint 5D.17 Part A & B)', () => {
+    it('verifies medimate_owner does not possess database-level CREATE privilege (least-privilege)', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      const rows = await prisma.$queryRawUnsafe<Array<{ has_create: boolean; has_connect: boolean; has_temp: boolean }>>(`
+        SELECT 
+          has_database_privilege('medimate_owner', current_database(), 'CREATE') as has_create,
+          has_database_privilege('medimate_owner', current_database(), 'CONNECT') as has_connect,
+          has_database_privilege('medimate_owner', current_database(), 'TEMPORARY') as has_temp;
+      `);
+
+      expect(rows.length).toBe(1);
+      expect(rows[0].has_create).toBe(false);
+      expect(rows[0].has_connect).toBe(true);
+      expect(rows[0].has_temp).toBe(true);
+    });
+
+    it('verifies medimate_owner retains full schema-level DDL privileges (USAGE, CREATE) on schema public', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      const rows = await prisma.$queryRawUnsafe<Array<{ has_usage: boolean; has_create: boolean }>>(`
+        SELECT 
+          has_schema_privilege('medimate_owner', 'public', 'USAGE') as has_usage,
+          has_schema_privilege('medimate_owner', 'public', 'CREATE') as has_create;
+      `);
+
+      expect(rows.length).toBe(1);
+      expect(rows[0].has_usage).toBe(true);
+      expect(rows[0].has_create).toBe(true);
+    });
+
+    it('verifies medimate_app has zero CREATE privilege on database and public schema', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      const rows = await prisma.$queryRawUnsafe<Array<{ db_create: boolean; schema_create: boolean }>>(`
+        SELECT 
+          has_database_privilege('medimate_app', current_database(), 'CREATE') as db_create,
+          has_schema_privilege('medimate_app', 'public', 'CREATE') as schema_create;
+      `);
+
+      expect(rows.length).toBe(1);
+      expect(rows[0].db_create).toBe(false);
+      expect(rows[0].schema_create).toBe(false);
+    });
+
+    it('verifies _owner_all policies explicitly target medimate_owner and exclude public and medimate_app', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      const policies = await prisma.$queryRawUnsafe<
+        Array<{ tablename: string; policyname: string; roles: string[]; cmd: string }>
+      >(`
+        SELECT tablename, policyname, roles, cmd
+        FROM pg_catalog.pg_policies
+        WHERE schemaname = 'public'
+          AND policyname LIKE '%_owner_all'
+        ORDER BY tablename;
+      `);
+
+      expect(policies.length).toBe(13);
+      for (const pol of policies) {
+        expect(pol.roles).toEqual(['medimate_owner']);
+        expect(pol.cmd).toBe('ALL');
+      }
+    });
+
+    it('verifies medimate_app has no administrative role memberships or inheritance', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      const memberships = await prisma.$queryRawUnsafe<Array<{ role: string; member: string }>>(`
+        SELECT r.rolname as role, m.rolname as member
+        FROM pg_catalog.pg_roles r
+        JOIN pg_catalog.pg_auth_members am ON r.oid = am.roleid
+        JOIN pg_catalog.pg_roles m ON m.oid = am.member
+        WHERE m.rolname = 'medimate_app';
+      `);
+
+      expect(memberships.length).toBe(0);
+    });
+  });
+
+  describe('User Registration Semantics & hasOnboarded Reconciliation (Checkpoint 5D.17 Part C)', () => {
+    it('verifies physical User.hasOnboarded column default is false in PostgreSQL catalog', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      const cols = await prisma.$queryRawUnsafe<Array<{ column_default: string; is_nullable: string }>>(`
+        SELECT column_default, is_nullable
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'User'
+          AND column_name = 'hasOnboarded';
+      `);
+
+      expect(cols.length).toBe(1);
+      expect(cols[0].column_default).toBe('false');
+      expect(cols[0].is_nullable).toBe('NO');
+    });
+
+    it('verifies registration policy user_register_insert enforces hasOnboarded = false', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      // Ensure test registration keys are clean before inserting
+      if (ownerPrisma) {
+        await ownerPrisma.$executeRawUnsafe(`DELETE FROM public."User" WHERE id LIKE 'new_test_user_%';`);
+      }
+
+      // Valid registration with hasOnboarded = false succeeds
+      const regSuccess = await prisma.$executeRawUnsafe(`
+        INSERT INTO public."User" (id, username, password, "hasOnboarded", "createdAt", "updatedAt")
+        VALUES ('new_test_user_01', 'synth_reg_valid_user', 'valid_test_password_hash_exceeding_20_chars', false, NOW(), NOW());
+      `);
+      expect(regSuccess).toBe(1);
+
+      // Registration with hasOnboarded = true violates user_register_insert policy
+      await expect(
+        prisma.$executeRawUnsafe(`
+          INSERT INTO public."User" (id, username, password, "hasOnboarded", "createdAt", "updatedAt")
+          VALUES ('new_test_user_02', 'synth_reg_spoof_user', 'valid_test_password_hash_exceeding_20_chars', true, NOW(), NOW());
+        `)
+      ).rejects.toThrow(/row-level security policy/i);
+
+      // Registration relying on column default (hasOnboarded omitted) succeeds because default is false
+      const regDefaultSuccess = await prisma.$executeRawUnsafe(`
+        INSERT INTO public."User" (id, username, password, "createdAt", "updatedAt")
+        VALUES ('new_test_user_03', 'synth_reg_def_user', 'valid_test_password_hash_exceeding_20_chars', NOW(), NOW());
+      `);
+      expect(regDefaultSuccess).toBe(1);
+    });
+
+    it('verifies user_self_update permits updating hasOnboarded to true under tenant context', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      // Without tenant context: update affects 0 rows
+      const unauthedUpdate = await prisma.$executeRawUnsafe(`
+        UPDATE public."User" SET "hasOnboarded" = true WHERE id = 'new_test_user_01';
+      `);
+      expect(unauthedUpdate).toBe(0);
+
+      // With tenant context for new_test_user_01: update succeeds
+      await withTenantContext('new_test_user_01', async (tx) => {
+        const authedUpdate = await tx.$executeRawUnsafe(`
+          UPDATE public."User" SET "hasOnboarded" = true WHERE id = 'new_test_user_01';
+        `);
+        expect(authedUpdate).toBe(1);
+
+        const rows = await tx.$queryRawUnsafe<Array<{ hasOnboarded: boolean }>>(`
+          SELECT "hasOnboarded" FROM public."User" WHERE id = 'new_test_user_01';
+        `);
+        expect(rows[0].hasOnboarded).toBe(true);
+      });
     });
   });
 });

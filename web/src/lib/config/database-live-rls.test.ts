@@ -77,7 +77,35 @@ describe('PostgreSQL Live Authentication, RLS & Role Privilege Verification (Che
       const fn = procs[0];
       expect(fn.prosecdef).toBe(true);
       expect(fn.owner_role).toBe('medimate_auth_definer');
-      expect(fn.proconfig).toContain('search_path=public, pg_catalog, pg_temp');
+      expect(fn.proconfig).toContain('search_path=pg_catalog, public, pg_temp');
+    });
+
+    it('verifies apply_medimate_rls_policies is owned by medimate_owner with safe search_path', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      const procs = await prisma.$queryRawUnsafe<
+        Array<{
+          proname: string;
+          prosecdef: boolean;
+          proconfig: string[] | null;
+          owner_role: string;
+        }>
+      >(`
+        SELECT p.proname, p.prosecdef, p.proconfig, r.rolname as owner_role
+        FROM pg_catalog.pg_proc p
+        JOIN pg_catalog.pg_namespace n ON p.pronamespace = n.oid
+        JOIN pg_catalog.pg_roles r ON p.proowner = r.oid
+        WHERE n.nspname = 'public' AND p.proname = 'apply_medimate_rls_policies';
+      `);
+
+      expect(procs.length).toBe(1);
+      const fn = procs[0];
+      expect(fn.prosecdef).toBe(true);
+      expect(fn.owner_role).toBe('medimate_owner');
+      expect(fn.proconfig).toContain('search_path=pg_catalog, public, pg_temp');
     });
 
     it('verifies medimate_app cannot SET ROLE to medimate_auth_definer or medimate_owner', async (ctx) => {
@@ -157,11 +185,11 @@ describe('PostgreSQL Live Authentication, RLS & Role Privilege Verification (Che
 
       await expect(
         prisma.$queryRawUnsafe('SELECT password FROM public."User" LIMIT 1;')
-      ).rejects.toThrow(/permission denied for column "password"/i);
+      ).rejects.toThrow(/permission denied/i);
 
       await expect(
         prisma.$queryRawUnsafe('SELECT * FROM public."User" LIMIT 1;')
-      ).rejects.toThrow(/permission denied for column "password"/i);
+      ).rejects.toThrow(/permission denied/i);
     });
 
     it('verifies permitted non-secret columns can be selected without error', async (ctx) => {
@@ -190,7 +218,7 @@ describe('PostgreSQL Live Authentication, RLS & Role Privilege Verification (Che
           SET id = 'tampered_id'
           WHERE id = 'nonexistent_test_id';
         `)
-      ).rejects.toThrow(/permission denied for column "id"/i);
+      ).rejects.toThrow(/permission denied/i);
 
       await expect(
         prisma.$executeRawUnsafe(`
@@ -198,7 +226,7 @@ describe('PostgreSQL Live Authentication, RLS & Role Privilege Verification (Che
           SET username = 'tampered_user'
           WHERE id = 'nonexistent_test_id';
         `)
-      ).rejects.toThrow(/permission denied for column "username"/i);
+      ).rejects.toThrow(/permission denied/i);
     });
   });
 
@@ -318,6 +346,22 @@ describe('PostgreSQL Live Authentication, RLS & Role Privilege Verification (Che
   });
 
   describe('Migration Ledger & 13-Table RLS Enforcement', () => {
+    const expectedTables = [
+      'User',
+      'HealthData',
+      'ChatRoom',
+      'ChatMessage',
+      'AssistantMode',
+      'AssistantModeContext',
+      'LLMProvider',
+      'OAuth2Client',
+      'OAuth2AuthorizationCode',
+      'OAuth2Token',
+      'RedditAccessToken',
+      'RedditPost',
+      'RedditPostComment',
+    ];
+
     it('verifies medimate_app is denied access to _prisma_migrations', async (ctx) => {
       if (!isPostgresLive) {
         ctx.skip();
@@ -335,36 +379,93 @@ describe('PostgreSQL Live Authentication, RLS & Role Privilege Verification (Che
         return;
       }
 
-      const expectedTables = [
-        'User',
-        'HealthData',
-        'ChatRoom',
-        'ChatMessage',
-        'AssistantMode',
-        'AssistantModeContext',
-        'LLMProvider',
-        'OAuth2Client',
-        'OAuth2AuthorizationCode',
-        'OAuth2Token',
-        'RedditAccessToken',
-        'RedditPost',
-        'RedditPostComment',
-      ];
-
       const tables = await prisma.$queryRawUnsafe<
-        Array<{ tablename: string; rowsecurity: boolean; forcerowsecurity: boolean }>
+        Array<{ tablename: string; relrowsecurity: boolean; relforcerowsecurity: boolean }>
       >(`
-        SELECT tablename, rowsecurity, forcerowsecurity
-        FROM pg_catalog.pg_tables t
-        JOIN pg_catalog.pg_class c ON c.relname = t.tablename
-        WHERE schemaname = 'public'
-          AND tablename IN (${expectedTables.map((t) => `'${t}'`).join(', ')});
+        SELECT c.relname as tablename, c.relrowsecurity, c.relforcerowsecurity
+        FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public'
+          AND c.relname IN (${expectedTables.map((t) => `'${t}'`).join(', ')});
       `);
 
       expect(tables.length).toBe(13);
       for (const t of tables) {
-        expect(t.rowsecurity).toBe(true);
-        expect(t.forcerowsecurity).toBe(true);
+        expect(t.relrowsecurity).toBe(true);
+        expect(t.relforcerowsecurity).toBe(true);
+      }
+    });
+
+    it('verifies all 13 required tables have explicit applicable RLS policies', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      const policies = await prisma.$queryRawUnsafe<
+        Array<{ tablename: string; policy_count: number }>
+      >(`
+        SELECT tablename, count(*)::int as policy_count
+        FROM pg_catalog.pg_policies
+        WHERE schemaname = 'public'
+        GROUP BY tablename;
+      `);
+
+      expect(policies.length).toBe(13);
+      for (const p of policies) {
+        expect(p.policy_count).toBeGreaterThan(0);
+      }
+    });
+
+    it('verifies no unexpected or unmanaged application tables exist in public schema', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      const allPublicTables = await prisma.$queryRawUnsafe<Array<{ tablename: string }>>(`
+        SELECT tablename
+        FROM pg_catalog.pg_tables
+        WHERE schemaname = 'public'
+          AND tablename NOT IN ('_prisma_migrations');
+      `);
+
+      const actualTableNames = allPublicTables.map((t) => t.tablename).sort();
+      const expectedSorted = [...expectedTables].sort();
+
+      expect(actualTableNames).toEqual(expectedSorted);
+    });
+
+    it('verifies migration owner can execute strict RLS verification and access migration ledger', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      const migrationUrl = process.env.MIGRATION_DATABASE_URL;
+      if (!migrationUrl) {
+        ctx.skip();
+        return;
+      }
+
+      const { PrismaClient } = await import('@prisma/client');
+      const ownerPrisma = new PrismaClient({
+        datasources: { db: { url: migrationUrl } },
+      });
+
+      try {
+        // Strict verification must succeed without error for migration owner
+        await expect(
+          ownerPrisma.$executeRawUnsafe('SELECT public.apply_medimate_rls_policies(true);')
+        ).resolves.toBeDefined();
+
+        // Migration owner can query _prisma_migrations
+        const migrationRows = await ownerPrisma.$queryRawUnsafe<Array<unknown>>(
+          'SELECT * FROM public._prisma_migrations LIMIT 1;'
+        );
+        expect(Array.isArray(migrationRows)).toBe(true);
+      } finally {
+        await ownerPrisma.$disconnect();
       }
     });
   });

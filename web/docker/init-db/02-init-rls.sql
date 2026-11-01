@@ -12,7 +12,7 @@ BEGIN
     RETURNS TABLE (id text, password text)
     LANGUAGE plpgsql
     SECURITY DEFINER
-    SET search_path = public, pg_catalog, pg_temp
+    SET search_path = pg_catalog, public, pg_temp
     AS $$
     BEGIN
         RETURN QUERY
@@ -46,7 +46,7 @@ CREATE OR REPLACE FUNCTION public.apply_medimate_rls_policies(p_strict boolean D
 RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, pg_catalog, pg_temp
+SET search_path = pg_catalog, public, pg_temp
 AS $rls$
 DECLARE
     r record;
@@ -284,17 +284,13 @@ BEGIN
         DROP POLICY IF EXISTS reddit_token_tenant_isolation ON public."RedditAccessToken";
         DROP POLICY IF EXISTS reddit_token_worker_policy ON public."RedditAccessToken";
 
-        DO $worker_policy$
-        BEGIN
-            IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_reddit_worker') THEN
-                CREATE POLICY reddit_token_worker_policy ON public."RedditAccessToken"
-                    TO medimate_reddit_worker
-                    FOR ALL
-                    USING (true)
-                    WITH CHECK (true);
-            END IF;
-        END
-        $worker_policy$;
+        IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_reddit_worker') THEN
+            CREATE POLICY reddit_token_worker_policy ON public."RedditAccessToken"
+                FOR ALL
+                TO medimate_reddit_worker
+                USING (true)
+                WITH CHECK (true);
+        END IF;
 
         IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_app') THEN
             EXECUTE 'REVOKE ALL ON TABLE public."RedditAccessToken" FROM medimate_app';
@@ -308,17 +304,13 @@ BEGIN
     -- Explicitly targeted to dedicated service role TO medimate_reddit_worker.
     IF EXISTS (SELECT FROM pg_catalog.pg_tables WHERE schemaname = 'public' AND tablename = 'RedditPost') THEN
         DROP POLICY IF EXISTS reddit_post_worker_policy ON public."RedditPost";
-        DO $post_worker_policy$
-        BEGIN
-            IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_reddit_worker') THEN
-                CREATE POLICY reddit_post_worker_policy ON public."RedditPost"
-                    TO medimate_reddit_worker
-                    FOR ALL
-                    USING (true)
-                    WITH CHECK (true);
-            END IF;
-        END
-        $post_worker_policy$;
+        IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_reddit_worker') THEN
+            CREATE POLICY reddit_post_worker_policy ON public."RedditPost"
+                FOR ALL
+                TO medimate_reddit_worker
+                USING (true)
+                WITH CHECK (true);
+        END IF;
 
         IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_app') THEN
             EXECUTE 'REVOKE ALL ON TABLE public."RedditPost" FROM medimate_app';
@@ -330,17 +322,13 @@ BEGIN
 
     IF EXISTS (SELECT FROM pg_catalog.pg_tables WHERE schemaname = 'public' AND tablename = 'RedditPostComment') THEN
         DROP POLICY IF EXISTS reddit_comment_worker_policy ON public."RedditPostComment";
-        DO $comment_worker_policy$
-        BEGIN
-            IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_reddit_worker') THEN
-                CREATE POLICY reddit_comment_worker_policy ON public."RedditPostComment"
-                    TO medimate_reddit_worker
-                    FOR ALL
-                    USING (true)
-                    WITH CHECK (true);
-            END IF;
-        END
-        $comment_worker_policy$;
+        IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_reddit_worker') THEN
+            CREATE POLICY reddit_comment_worker_policy ON public."RedditPostComment"
+                FOR ALL
+                TO medimate_reddit_worker
+                USING (true)
+                WITH CHECK (true);
+        END IF;
 
         IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_app') THEN
             EXECUTE 'REVOKE ALL ON TABLE public."RedditPostComment" FROM medimate_app';
@@ -378,10 +366,11 @@ BEGIN
 END
 $app_revoke$;
 
--- Grant execute on policy management function exclusively to schema owner
+-- Grant execute and assign ownership of policy management function to schema owner
 DO $owner_grant$
 BEGIN
     IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_owner') THEN
+        ALTER FUNCTION public.apply_medimate_rls_policies(boolean) OWNER TO medimate_owner;
         GRANT EXECUTE ON FUNCTION public.apply_medimate_rls_policies(boolean) TO medimate_owner;
     END IF;
 END
@@ -406,12 +395,12 @@ BEGIN
 END
 $schema_revoke$;
 
--- Create event trigger to automatically apply RLS whenever new tables are created via Prisma DDL
+-- Create event trigger function to automatically apply RLS whenever new tables are created via Prisma DDL
 CREATE OR REPLACE FUNCTION public.trg_apply_rls_on_ddl()
 RETURNS event_trigger
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, pg_catalog, pg_temp
+SET search_path = pg_catalog, public, pg_temp
 AS $$
 BEGIN
     PERFORM public.apply_medimate_rls_policies(false);
@@ -424,6 +413,10 @@ DO $trg_revoke$
 BEGIN
     IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_app') THEN
         REVOKE ALL ON FUNCTION public.trg_apply_rls_on_ddl() FROM medimate_app;
+    END IF;
+    IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_owner') THEN
+        ALTER FUNCTION public.trg_apply_rls_on_ddl() OWNER TO medimate_owner;
+        GRANT EXECUTE ON FUNCTION public.trg_apply_rls_on_ddl() TO medimate_owner;
     END IF;
 END
 $trg_revoke$;

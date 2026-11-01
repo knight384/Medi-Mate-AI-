@@ -198,7 +198,7 @@ describe('Database Multi-Tenant Isolation & RLS Infrastructure', () => {
       const content = await fsp.readFile(initRlsPath, 'utf-8');
       expect(content).toContain('CREATE OR REPLACE FUNCTION public.lookup_user_for_auth');
       expect(content).toContain('SECURITY DEFINER');
-      expect(content).toContain('SET search_path = public, pg_catalog, pg_temp');
+      expect(content).toContain('SET search_path = pg_catalog, public, pg_temp');
       expect(content).toContain('FROM public."User" u');
       expect(content).toContain('OWNER TO medimate_auth_definer');
     });
@@ -217,6 +217,8 @@ describe('Database Multi-Tenant Isolation & RLS Infrastructure', () => {
       expect(content).toContain("CREATE OR REPLACE FUNCTION public.trg_apply_rls_on_ddl()");
       expect(content).toContain("REVOKE ALL ON FUNCTION public.apply_medimate_rls_policies(boolean) FROM PUBLIC");
       expect(content).toContain("REVOKE ALL ON FUNCTION public.trg_apply_rls_on_ddl() FROM PUBLIC");
+      expect(content).toContain("ALTER FUNCTION public.apply_medimate_rls_policies(boolean) OWNER TO medimate_owner;");
+      expect(content).toContain("ALTER FUNCTION public.trg_apply_rls_on_ddl() OWNER TO medimate_owner;");
     });
 
     it('verifies 02-init-rls.sql uses physical column names for OAuth tables (user_id) (Task D)', async () => {

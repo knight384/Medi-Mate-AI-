@@ -86,6 +86,13 @@ IF EXISTS (SELECT FROM pg_catalog.pg_tables WHERE schemaname = 'public' AND tabl
     EXECUTE format('GRANT INSERT (id, username, password, "hasOnboarded", "createdAt", "updatedAt") ON TABLE public."User" TO %I', :'app_user');
 END IF;
 
+-- 5c. Enforce column-level least-privilege on User table for profile and onboarding updates (Task J)
+-- Prevents privilege escalation by restricting UPDATE to user-mutable fields only (id, username, createdAt immutable).
+IF EXISTS (SELECT FROM pg_catalog.pg_tables WHERE schemaname = 'public' AND tablename = 'User') THEN
+    EXECUTE format('REVOKE UPDATE ON TABLE public."User" FROM %I', :'app_user');
+    EXECUTE format('GRANT UPDATE (name, password, "hasOnboarded", "updatedAt") ON TABLE public."User" TO %I', :'app_user');
+END IF;
+
 -- Explicitly revoke access to migration history from application runtime
 IF EXISTS (SELECT FROM pg_catalog.pg_tables WHERE schemaname = 'public' AND tablename = '_prisma_migrations') THEN
     EXECUTE format('REVOKE ALL ON TABLE _prisma_migrations FROM %I', :'app_user');

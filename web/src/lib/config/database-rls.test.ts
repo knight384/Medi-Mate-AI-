@@ -157,6 +157,12 @@ describe('Database Multi-Tenant Isolation & RLS Infrastructure', () => {
       expect(content).toContain('GRANT INSERT (id, username, password, "hasOnboarded", "createdAt", "updatedAt") ON TABLE public."User" TO %I');
     });
 
+    it('verifies 01-init-roles.sh restricts User table UPDATE to mutable columns only (Task J)', async () => {
+      const content = await fsp.readFile(initRolesPath, 'utf-8');
+      expect(content).toContain('REVOKE UPDATE ON TABLE public."User" FROM %I');
+      expect(content).toContain('GRANT UPDATE (name, password, "hasOnboarded", "updatedAt") ON TABLE public."User" TO %I');
+    });
+
     it('verifies 01-init-roles.sh uses dynamic SQL format(%I, %L) to safely escape identifiers and literals', async () => {
       const content = await fsp.readFile(initRolesPath, 'utf-8');
       expect(content).toContain("EXECUTE format('CREATE ROLE %I WITH LOGIN PASSWORD %L NOSUPERUSER INHERIT'");

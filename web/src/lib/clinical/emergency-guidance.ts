@@ -63,7 +63,7 @@ export function getRegionalEmergencyDetails(regionCode?: string | null): Regiona
   const disclaimer = 'MediMate AI is an informational tool and cannot automatically dispatch emergency personnel or contact emergency services on your behalf.';
 
   if (config) {
-    const specialNote = config.code === 'IN' ? ' via the National Emergency Response Support System (ERSS)' : '';
+    const specialNote = config.code === 'IN' ? ' via the National Emergency Response Support System (ERSS), or state-specific medical ambulance dispatch (such as 108 where operational)' : '';
     return {
       code: config.code,
       countryName: config.country,

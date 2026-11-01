@@ -6,7 +6,8 @@ import {z} from "zod";
 import {processBatchWithConcurrency} from "@/lib/health-data/parser/util";
 import {currentDeploymentEnv} from "@/lib/current-deployment-env";
 
-type ZodTypeAny = z.ZodTypeAny;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type ZodTypeAny = z.ZodType<any, any>;
 type ZodRawShape = { [k: string]: ZodTypeAny };
 
 export class GoogleVisionParser extends BaseVisionParser {
@@ -111,48 +112,54 @@ export class GoogleVisionParser extends BaseVisionParser {
     private removeNullable<T extends ZodTypeAny>(schema: T): any {
         // Handle nullable types
         if (schema instanceof z.ZodNullable) {
-            return this.removeNullable(schema.unwrap());
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            return this.removeNullable((schema as any).unwrap());
         }
 
         // Handle object types
         if (schema instanceof z.ZodObject) {
-            const shape = schema.shape as ZodRawShape;
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const shape = (schema as any).shape as ZodRawShape;
             const newShape: ZodRawShape = {};
 
             for (const [key, value] of Object.entries(shape)) {
                 newShape[key] = this.removeNullable(value);
             }
 
-            return z.object(newShape) as z.ZodType<z.infer<T>>;
+            return z.object(newShape);
         }
 
         // Handle array types
         if (schema instanceof z.ZodArray) {
-            return z.array(this.removeNullable(schema.element)) as z.ZodType<z.infer<T>>;
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            return z.array(this.removeNullable((schema as any).element));
         }
 
         // Handle optional types
         if (schema instanceof z.ZodOptional) {
-            return z.optional(this.removeNullable(schema.unwrap())) as z.ZodType<z.infer<T>>;
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            return z.optional(this.removeNullable((schema as any).unwrap()));
         }
 
         // Handle union types
         if (schema instanceof z.ZodUnion) {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            return z.union(schema.options.map((option: any) =>
+            return z.union((schema as any).options.map((option: any) =>
                 this.removeNullable(option)
-            )) as z.ZodType<z.infer<T>>;
+            ));
         }
 
         // Handle intersection types
         if (schema instanceof z.ZodIntersection) {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const s = schema as any;
             return z.intersection(
-                this.removeNullable(schema._def.left),
-                this.removeNullable(schema._def.right)
-            ) as z.ZodType<z.infer<T>>;
+                this.removeNullable(s._def?.left ?? s.left),
+                this.removeNullable(s._def?.right ?? s.right)
+            );
         }
 
         // Return other types as is
-        return schema as z.ZodType<z.infer<T>>;
+        return schema;
     }
 }

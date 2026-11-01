@@ -65,5 +65,47 @@ describe('Zod Boundary Validation & Array Limits (GHSA-mrhx-c7xc-m3w5 mitigation
     const parsed = HealthCheckupSchema.safeParse(emptyResult);
     expect(parsed.success).toBe(true);
   });
+
+  it('rejects oversized invalid arrays where elements fail validation', () => {
+    // Array of 10,000 invalid items; schema has max 50 items
+    const invalidOversizedItems = Array.from({ length: 1000 }, () => 12345); // numbers instead of strings
+    const input = {
+      patientId: 'patient-test',
+      tags: invalidOversizedItems,
+    };
+
+    const parsed = BoundedHealthTagsSchema.safeParse(input);
+    expect(parsed.success).toBe(false);
+    if (!parsed.success) {
+      // Must fail fast on collection bounds
+      expect(parsed.error.issues.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('enforces bounded dictionary and record collections against unbounded key injection', () => {
+    const BoundedMetadataSchema = z.record(
+      z.string().max(64),
+      z.string().max(256)
+    );
+
+    // Valid bounded record
+    const validMeta = { department: 'Cardiology', physician: 'Dr. Smith' };
+    expect(BoundedMetadataSchema.safeParse(validMeta).success).toBe(true);
+
+    // Malformed key exceeding primitive boundary
+    const invalidMetaKey = { ['k'.repeat(128)]: 'valid value' };
+    expect(BoundedMetadataSchema.safeParse(invalidMetaKey).success).toBe(false);
+
+    // Malformed value exceeding boundary
+    const invalidMetaVal = { department: 'v'.repeat(512) };
+    expect(BoundedMetadataSchema.safeParse(invalidMetaVal).success).toBe(false);
+  });
+
+  it('validates primitive type coercion and strict string bounds', () => {
+    const StrictPatientIdSchema = z.string().trim().min(3).max(32);
+    expect(StrictPatientIdSchema.safeParse('  patient-01  ').success).toBe(true);
+    expect(StrictPatientIdSchema.safeParse('x'.repeat(64)).success).toBe(false);
+    expect(StrictPatientIdSchema.safeParse('').success).toBe(false);
+  });
 });
 

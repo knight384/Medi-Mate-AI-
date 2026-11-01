@@ -121,7 +121,7 @@ export function safeParseWithBounds<T>(
   schema: z.ZodType<T>,
   data: unknown,
   options?: StructuralBoundsOptions
-): z.SafeParseReturnType<unknown, T> {
+): { success: true; data: T } | { success: false; error: z.ZodError } {
   try {
     validateStructuralBounds(data, options);
   } catch (error) {

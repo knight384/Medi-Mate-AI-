@@ -56,7 +56,7 @@ describe('LLMProvider Secret Isolation & Response Scrubbing', () => {
   describe('GET /api/llm-providers', () => {
     it('returns 401 when unauthenticated', async () => {
       const { auth } = await import('@/auth');
-      vi.mocked(auth).mockResolvedValue(null);
+      vi.mocked(auth).mockResolvedValue(null as unknown as Awaited<ReturnType<typeof auth>>);
       const res = await getProviders();
       expect(res.status).toBe(401);
     });
@@ -108,12 +108,12 @@ describe('LLMProvider Secret Isolation & Response Scrubbing', () => {
       expect(json.llmProviders).toHaveLength(2);
 
       // Owner provider check
-      const ownerProv = json.llmProviders.find((p) => p.id === 'prov_1');
+      const ownerProv = json.llmProviders.find((p: ProviderItem) => p.id === 'prov_1');
       expect(ownerProv?.hasApiKey).toBe(true);
       expect(ownerProv?.apiKey).toBe('••••••••');
 
       // System / empty key provider check
-      const sysProv = json.llmProviders.find((p) => p.id === 'prov_system');
+      const sysProv = json.llmProviders.find((p: ProviderItem) => p.id === 'prov_system');
       expect(sysProv?.hasApiKey).toBe(false);
       expect(sysProv?.apiKey).toBe('');
     });

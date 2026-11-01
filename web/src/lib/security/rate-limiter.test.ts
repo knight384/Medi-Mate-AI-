@@ -177,23 +177,94 @@ describe('checkRateLimit with Redis and Outage Fallback', () => {
   });
 });
 
-describe('getClientIp', () => {
-  it('extracts first IP from x-forwarded-for header', () => {
+describe('getClientIp & Proxy Spoofing Defense', () => {
+  it('ignores client-sent x-forwarded-for when trustProxy is disabled (spoofing protection)', () => {
     const req = new Request('http://localhost', {
-      headers: { 'x-forwarded-for': '203.0.113.195, 70.41.3.18' },
+      headers: {
+        'x-forwarded-for': '203.0.113.195, 70.41.3.18',
+        'x-real-ip': '198.51.100.4',
+        'cf-connecting-ip': '1.1.1.1',
+      },
     });
-    expect(getClientIp(req)).toBe('203.0.113.195');
+
+    // Untrusted mode (default): direct external client cannot spoof its IP
+    expect(getClientIp(req, { trustProxy: false })).toBe('127.0.0.1');
   });
 
-  it('extracts IP from x-real-ip if no forwarded header', () => {
+  it('honors forwarding headers only when explicitly configured with trustProxy: true', () => {
     const req = new Request('http://localhost', {
-      headers: { 'x-real-ip': '198.51.100.4' },
+      headers: {
+        'cf-connecting-ip': '198.51.100.25',
+      },
     });
-    expect(getClientIp(req)).toBe('198.51.100.4');
+    expect(getClientIp(req, { trustProxy: true })).toBe('198.51.100.25');
+
+    const reqXff = new Request('http://localhost', {
+      headers: {
+        'x-forwarded-for': '203.0.113.50, 10.0.0.1',
+      },
+    });
+    expect(getClientIp(reqXff, { trustProxy: true })).toBe('203.0.113.50');
   });
 
-  it('defaults to 127.0.0.1 when no headers present', () => {
+  it('rejects malformed and injection-laden IP headers into quarantined malformed-ip bucket', () => {
+    const maliciousHeaders = [
+      '192.168.1.999', // invalid octet
+      '203.0.113.1; DROP TABLE users;', // SQL injection
+      '<script>alert(1)</script>', // XSS
+      '../../etc/passwd', // path traversal
+      'not-an-ip-address', // garbage string
+      '   ', // whitespace only
+    ];
+
+    for (const badIp of maliciousHeaders) {
+      const req = new Request('http://localhost', {
+        headers: { 'x-forwarded-for': badIp },
+      });
+      expect(getClientIp(req, { trustProxy: true })).toBe('malformed-ip');
+    }
+  });
+
+  it('validates IPv6 and loopback addresses properly', () => {
+    const reqIpv6 = new Request('http://localhost', {
+      headers: { 'x-real-ip': '::1' },
+    });
+    expect(getClientIp(reqIpv6, { trustProxy: true })).toBe('::1');
+  });
+
+  it('defaults to safe fallback when no headers are present', () => {
     const req = new Request('http://localhost');
-    expect(getClientIp(req)).toBe('127.0.0.1');
+    expect(getClientIp(req, { trustProxy: true, defaultIp: '10.0.0.99' })).toBe('10.0.0.99');
+  });
+});
+
+describe('Multi-Replica Scaling & Redis Reconnection Scenarios', () => {
+  it('applies conservative per-instance limits across multi-replica cluster during Redis outage', async () => {
+    vi.spyOn(redisConnectionManager, 'getClient').mockReturnValue(null);
+    vi.spyOn(redisConnectionManager, 'getConnectionState').mockReturnValue({
+      connected: false,
+      lastError: 'Redis cluster offline',
+      reconnectAttempts: 3,
+    });
+
+    // 3 replicas configured; total global budget is 6 requests.
+    // Each replica should enforce conservative emergency budget of 6 / 3 = 2 requests.
+    const config = {
+      maxRequests: 6,
+      windowSeconds: 60,
+      replicaCount: 3,
+      prefix: 'replica-test',
+    };
+
+    const res1 = await checkRateLimit('user-rep', config);
+    expect(res1.allowed).toBe(true);
+    expect(res1.limit).toBe(2);
+
+    const res2 = await checkRateLimit('user-rep', config);
+    expect(res2.allowed).toBe(true);
+
+    const res3 = await checkRateLimit('user-rep', config);
+    expect(res3.allowed).toBe(false); // Blocked after 2 requests on this instance
+    expect(res3.source).toBe('memory-fallback');
   });
 });

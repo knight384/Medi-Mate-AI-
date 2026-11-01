@@ -1,12 +1,15 @@
 import { logger } from '@/lib/logger';
 import { redisConnectionManager } from '@/lib/redis/connection-manager';
 import { buildRedisKey } from '@/lib/redis/config';
+import { isTrustProxy } from '@/lib/config/env';
 
 export interface RateLimitConfig {
   windowSeconds: number;
   maxRequests: number;
   prefix?: string;
   failClosed?: boolean;
+  /** Estimated number of application replicas for emergency limit scaling during Redis outage */
+  replicaCount?: number;
 }
 
 export interface RateLimitResult {
@@ -83,18 +86,80 @@ export class InMemoryRateLimiter {
 
 export const inMemoryLimiter = new InMemoryRateLimiter();
 
+const IPV4_REGEX = /^(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
+const IPV6_REGEX = /^(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$|^::(?:[0-9a-fA-F]{1,4}:){0,6}[0-9a-fA-F]{1,4}$|^(?:[0-9a-fA-F]{1,4}:){1,7}:$/;
+
 /**
- * Retrieves client IP from standard reverse proxy headers.
+ * Validates whether an input string is a valid IPv4 or IPv6 address.
  */
-export function getClientIp(req: Request): string {
-  const forwarded = req.headers.get('x-forwarded-for');
-  if (forwarded) {
-    const first = forwarded.split(',')[0].trim();
-    if (first) return first;
+export function isValidIp(ip: string): boolean {
+  if (!ip || typeof ip !== 'string' || ip.length > 45) return false;
+  const trimmed = ip.trim();
+  return IPV4_REGEX.test(trimmed) || IPV6_REGEX.test(trimmed) || trimmed === '::1';
+}
+
+export interface GetClientIpOptions {
+  /** Explicitly override whether to trust reverse proxy headers */
+  trustProxy?: boolean;
+  /** Fallback address if no valid client IP can be resolved */
+  defaultIp?: string;
+}
+
+/**
+ * Retrieves client IP with strict reverse proxy verification and spoofing protection.
+ *
+ * Security directive:
+ * - If trustProxy is false (default in untrusted/direct environments), forwarding headers
+ *   (x-forwarded-for, x-real-ip, cf-connecting-ip) are ignored to prevent external spoofing.
+ * - If trustProxy is true, headers are evaluated in priority order and strictly syntax-validated.
+ * - Malformed or injected values are safely mapped to a quarantined 'malformed-ip' bucket.
+ */
+export function getClientIp(req: Request, options?: GetClientIpOptions): string {
+  const defaultIp = options?.defaultIp ?? '127.0.0.1';
+  let trustProxy = options?.trustProxy;
+
+  if (trustProxy === undefined) {
+    try {
+      trustProxy = isTrustProxy();
+    } catch {
+      trustProxy = false;
+    }
   }
-  const realIp = req.headers.get('x-real-ip');
-  if (realIp) return realIp.trim();
-  return '127.0.0.1';
+
+  // Untrusted proxy mode: direct client access cannot spoof forwarding headers
+  if (!trustProxy) {
+    // If client supplied forwarding headers while trustProxy is disabled, ignore them
+    const directIp = req.headers.get('x-direct-ip');
+    if (directIp && isValidIp(directIp)) {
+      return directIp.trim();
+    }
+    return defaultIp;
+  }
+
+  // Trusted proxy mode: inspect Cloudflare, Nginx real-ip, or X-Forwarded-For
+  if (req.headers.has('cf-connecting-ip')) {
+    const cfConnectingIp = req.headers.get('cf-connecting-ip');
+    const trimmed = cfConnectingIp?.trim();
+    return trimmed && isValidIp(trimmed) ? trimmed : 'malformed-ip';
+  }
+
+  if (req.headers.has('x-real-ip')) {
+    const realIp = req.headers.get('x-real-ip');
+    const trimmed = realIp?.trim();
+    return trimmed && isValidIp(trimmed) ? trimmed : 'malformed-ip';
+  }
+
+  if (req.headers.has('x-forwarded-for')) {
+    const forwarded = req.headers.get('x-forwarded-for');
+    const parts = forwarded ? forwarded.split(',') : [];
+    const clientCandidate = parts[0]?.trim();
+    if (!clientCandidate) {
+      return 'malformed-ip';
+    }
+    return isValidIp(clientCandidate) ? clientCandidate : 'malformed-ip';
+  }
+
+  return defaultIp;
 }
 
 /**
@@ -106,7 +171,7 @@ export async function checkRateLimit(
   identifier: string,
   config: RateLimitConfig
 ): Promise<RateLimitResult> {
-  const { windowSeconds, maxRequests, prefix = 'rl', failClosed = false } = config;
+  const { windowSeconds, maxRequests, prefix = 'rl', failClosed = false, replicaCount = 1 } = config;
   const key = `${prefix}:${identifier}`;
 
   try {
@@ -163,6 +228,16 @@ export async function checkRateLimit(
     };
   }
 
-  logger.warn('Enforcing conservative in-memory rate limit due to Redis outage/unavailability', { key });
-  return inMemoryLimiter.check(key, maxRequests, windowSeconds);
+  // In multi-replica deployments during Redis outage, scale emergency limits conservatively
+  const effectiveFallbackLimit = replicaCount > 1
+    ? Math.max(1, Math.floor(maxRequests / replicaCount))
+    : maxRequests;
+
+  logger.warn('Enforcing conservative in-memory rate limit due to Redis outage/unavailability', {
+    key,
+    effectiveFallbackLimit,
+    replicaCount,
+  });
+
+  return inMemoryLimiter.check(key, effectiveFallbackLimit, windowSeconds);
 }

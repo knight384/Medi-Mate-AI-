@@ -25,6 +25,11 @@ const envSchema = z.object({
   REDIS_KEY_PREFIX: z.string().default('open-health:'),
   REDIS_CONNECT_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
   REDIS_MAX_RETRIES: z.coerce.number().int().min(0).default(10),
+  TRUST_PROXY: z
+    .string()
+    .default('false')
+    .transform((value) => value === 'true' || value === '1'),
+  TRUSTED_PROXIES: z.string().default('127.0.0.1,::1'),
 });
 
 export type DeploymentEnv = z.infer<typeof deploymentEnvSchema>;
@@ -66,4 +71,12 @@ export function isProduction(): boolean {
 
 export function isRedisEnabled(): boolean {
   return getEnv().REDIS_ENABLED;
+}
+
+export function isTrustProxy(): boolean {
+  return getEnv().TRUST_PROXY;
+}
+
+export function getTrustedProxies(): string[] {
+  return getEnv().TRUSTED_PROXIES.split(',').map((s) => s.trim()).filter(Boolean);
 }

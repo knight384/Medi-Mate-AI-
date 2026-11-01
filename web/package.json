@@ -10,7 +10,9 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run --no-file-parallelism",
     "test:watch": "vitest",
-    "db:init-rls": "ts-node --compiler-options {\"module\":\"CommonJS\"} prisma/post-migration-rls.ts",
+    "test:live-rls": "vitest run src/lib/config/database-live-rls.test.ts",
+    "db:init-rls": "node prisma/post-migration-rls.cjs",
+    "db:migrate:deploy": "npx prisma migrate deploy && node prisma/post-migration-rls.cjs",
     "validate": "npm run typecheck && npm run lint && npm run test",
     "deploy:trigger-prod": "npx trigger.dev@3.3.16 deploy"
   },

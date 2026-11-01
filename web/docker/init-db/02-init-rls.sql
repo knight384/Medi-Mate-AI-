@@ -368,10 +368,17 @@ BEGIN
 END;
 $rls$;
 
--- Revoke execute on policy management function from PUBLIC
+-- Revoke execute on policy management function from PUBLIC and application runtime role
 REVOKE ALL ON FUNCTION public.apply_medimate_rls_policies(boolean) FROM PUBLIC;
+DO $app_revoke$
+BEGIN
+    IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_app') THEN
+        REVOKE ALL ON FUNCTION public.apply_medimate_rls_policies(boolean) FROM medimate_app;
+    END IF;
+END
+$app_revoke$;
 
--- Grant execute on policy management function to schema owner
+-- Grant execute on policy management function exclusively to schema owner
 DO $owner_grant$
 BEGIN
     IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_owner') THEN
@@ -382,6 +389,22 @@ $owner_grant$;
 
 -- Execute bootstrap policy application in non-strict mode (safe for empty data directory)
 SELECT public.apply_medimate_rls_policies(false);
+
+-- Ensure public schema trust boundaries: untrusted roles cannot create objects in searched schemas
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+DO $schema_revoke$
+BEGIN
+    IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_app') THEN
+        REVOKE CREATE ON SCHEMA public FROM medimate_app;
+    END IF;
+    IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_auth_definer') THEN
+        REVOKE CREATE ON SCHEMA public FROM medimate_auth_definer;
+    END IF;
+    IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_reddit_worker') THEN
+        REVOKE CREATE ON SCHEMA public FROM medimate_reddit_worker;
+    END IF;
+END
+$schema_revoke$;
 
 -- Create event trigger to automatically apply RLS whenever new tables are created via Prisma DDL
 CREATE OR REPLACE FUNCTION public.trg_apply_rls_on_ddl()
@@ -395,8 +418,15 @@ BEGIN
 END;
 $$;
 
--- Revoke execute on trigger function from PUBLIC
+-- Revoke execute on trigger function from PUBLIC and application runtime role
 REVOKE ALL ON FUNCTION public.trg_apply_rls_on_ddl() FROM PUBLIC;
+DO $trg_revoke$
+BEGIN
+    IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_app') THEN
+        REVOKE ALL ON FUNCTION public.trg_apply_rls_on_ddl() FROM medimate_app;
+    END IF;
+END
+$trg_revoke$;
 
 DROP EVENT TRIGGER IF EXISTS medimate_rls_event_trigger;
 CREATE EVENT TRIGGER medimate_rls_event_trigger

@@ -300,10 +300,24 @@ describe('Database Multi-Tenant Isolation & RLS Infrastructure', () => {
       expect(content).toContain('RAISE EXCEPTION \'MediMate AI RLS verification failed: Required table public."%" does not exist\'');
     });
 
-    it('verifies prisma/post-migration-rls.ts invokes apply_medimate_rls_policies in strict mode (Part B)', async () => {
-      const postMigrationPath = path.resolve(__dirname, '../../../prisma/post-migration-rls.ts');
-      const content = await fsp.readFile(postMigrationPath, 'utf-8');
-      expect(content).toContain('SELECT public.apply_medimate_rls_policies(true);');
+    it('verifies prisma/post-migration-rls.ts and .cjs invoke apply_medimate_rls_policies with migration connection (Checkpoint 5D.14)', async () => {
+      const tsPath = path.resolve(__dirname, '../../../prisma/post-migration-rls.ts');
+      const cjsPath = path.resolve(__dirname, '../../../prisma/post-migration-rls.cjs');
+      const tsContent = await fsp.readFile(tsPath, 'utf-8');
+      const cjsContent = await fsp.readFile(cjsPath, 'utf-8');
+
+      expect(tsContent).toContain('process.env.MIGRATION_DATABASE_URL || process.env.DATABASE_URL');
+      expect(tsContent).toContain('SELECT public.apply_medimate_rls_policies(true);');
+      expect(cjsContent).toContain('process.env.MIGRATION_DATABASE_URL || process.env.DATABASE_URL');
+      expect(cjsContent).toContain('SELECT public.apply_medimate_rls_policies(true);');
+    });
+
+    it('verifies 02-init-rls.sql revokes policy execution and schema creation from runtime role (Checkpoint 5D.14)', async () => {
+      const content = await fsp.readFile(initRlsPath, 'utf-8');
+      expect(content).toContain('REVOKE ALL ON FUNCTION public.apply_medimate_rls_policies(boolean) FROM medimate_app');
+      expect(content).toContain('REVOKE ALL ON FUNCTION public.trg_apply_rls_on_ddl() FROM medimate_app');
+      expect(content).toContain('REVOKE CREATE ON SCHEMA public FROM PUBLIC');
+      expect(content).toContain('REVOKE CREATE ON SCHEMA public FROM medimate_app');
     });
   });
 });

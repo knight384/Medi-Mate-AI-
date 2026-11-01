@@ -13,7 +13,10 @@ import { PrismaClient } from '@prisma/client';
  * Executes `public.apply_medimate_rls_policies(true)` in strict mode:
  * Fails visibly if any expected application table or policy is missing.
  */
-const prisma = new PrismaClient();
+const migrationUrl = process.env.MIGRATION_DATABASE_URL || process.env.DATABASE_URL;
+const prisma = new PrismaClient({
+  datasources: migrationUrl ? { db: { url: migrationUrl } } : undefined,
+});
 
 async function main() {
   console.log('MediMate AI: Applying and verifying multi-tenant RLS policies (strict mode)...');

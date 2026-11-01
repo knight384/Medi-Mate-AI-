@@ -1235,10 +1235,11 @@ describe('PostgreSQL Live Authentication, RLS & Role Privilege Verification (Che
           ORDER BY started_at ASC;
         `);
 
-        expect(migrations.length).toBeGreaterThanOrEqual(2);
+        expect(migrations.length).toBeGreaterThanOrEqual(3);
         const migrationNames = migrations.map((m) => m.migration_name);
         expect(migrationNames).toContain('0_init');
         expect(migrationNames).toContain('20261101120000_reconcile_user_has_onboarded');
+        expect(migrationNames).toContain('20261101130000_add_llm_provider_author_index');
 
         for (const m of migrations) {
           expect(m.finished_at).not.toBeNull();
@@ -1682,7 +1683,7 @@ describe('PostgreSQL Live Authentication, RLS & Role Privilege Verification (Che
         ORDER BY started_at ASC;
       `);
 
-      expect(applied.length).toBeGreaterThanOrEqual(2);
+      expect(applied.length).toBeGreaterThanOrEqual(3);
       for (const m of applied) {
         expect(m.checksum).toBeDefined();
         expect(m.checksum.length).toBe(64); // SHA-256 hash
@@ -1717,6 +1718,82 @@ describe('PostgreSQL Live Authentication, RLS & Role Privilege Verification (Che
         expect(t.rowsecurity).toBe(true);
         expect(t.forcerowsecurity).toBe(true);
       }
+    });
+  });
+
+  describe('LLMProvider System Secret Masking & Forward Migration Verification (Checkpoint 5D.20 Part A & B)', () => {
+    it('verifies LLMProvider_authorId_idx physical index exists in PostgreSQL catalog', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      const idx = await prisma.$queryRawUnsafe<Array<{ indexname: string }>>(`
+        SELECT indexname FROM pg_catalog.pg_indexes
+        WHERE schemaname = 'public'
+          AND tablename = 'LLMProvider'
+          AND indexname = 'LLMProvider_authorId_idx';
+      `);
+
+      expect(idx.length).toBe(1);
+    });
+
+    it('verifies synthetic system provider with non-empty apiKey cannot be retrieved by ordinary tenants', async (ctx) => {
+      if (!isPostgresLive || !ownerPrisma) {
+        ctx.skip();
+        return;
+      }
+
+      const canaryProviderId = 'synth_sys_canary_secret_provider';
+      const secretCanary = 'SYNTHETIC_SECRET_CANARY_VALUE_5D20';
+
+      try {
+        // Seed as owner: system provider with non-empty secret key
+        await ownerPrisma.$executeRawUnsafe(`
+          INSERT INTO public."LLMProvider" (id, "providerId", name, "apiKey", "authorId", "createdAt", "updatedAt", "apiURL", "order")
+          VALUES ('${canaryProviderId}', 'canary_llm', 'Canary System Secret', '${secretCanary}', NULL, NOW(), NOW(), 'https://api.canary.ai', 99)
+          ON CONFLICT (id) DO UPDATE SET "apiKey" = EXCLUDED."apiKey";
+        `);
+
+        // Verify unauthenticated query returns 0 rows
+        const unauthedRows = await prisma.$queryRawUnsafe<Array<{ id: string }>>(
+          `SELECT id FROM public."LLMProvider" WHERE id = '${canaryProviderId}';`
+        );
+        expect(unauthedRows.length).toBe(0);
+
+        // Verify Alpha tenant context returns 0 rows (RLS blocks system provider with non-empty key)
+        await withTenantContext(alphaId, async (tx) => {
+          const alphaRows = await tx.$queryRawUnsafe<Array<{ id: string; apiKey: string }>>(
+            `SELECT id, "apiKey" FROM public."LLMProvider" WHERE id = '${canaryProviderId}';`
+          );
+          expect(alphaRows.length).toBe(0);
+        });
+
+        // Verify Beta tenant context returns 0 rows
+        await withTenantContext(betaId, async (tx) => {
+          const betaRows = await tx.$queryRawUnsafe<Array<{ id: string; apiKey: string }>>(
+            `SELECT id, "apiKey" FROM public."LLMProvider" WHERE id = '${canaryProviderId}';`
+          );
+          expect(betaRows.length).toBe(0);
+        });
+      } finally {
+        await ownerPrisma.$executeRawUnsafe(`DELETE FROM public."LLMProvider" WHERE id = '${canaryProviderId}';`);
+      }
+    });
+
+    it('verifies system default provider with empty apiKey is accessible to tenants', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      await withTenantContext(alphaId, async (tx) => {
+        const rows = await tx.$queryRawUnsafe<Array<{ id: string; apiKey: string }>>(
+          `SELECT id, "apiKey" FROM public."LLMProvider" WHERE id = 'synth_sys_llm_prov_01';`
+        );
+        expect(rows.length).toBe(1);
+        expect(rows[0].apiKey).toBe('');
+      });
     });
   });
 });

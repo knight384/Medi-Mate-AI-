@@ -158,6 +158,8 @@ model LLMProvider {
   assistantModes AssistantMode[]
   author         User?           @relation(fields: [authorId], references: [id])
   chatRooms      ChatRoom[]
+
+  @@index([authorId])
 }
 
 model RedditAccessToken {

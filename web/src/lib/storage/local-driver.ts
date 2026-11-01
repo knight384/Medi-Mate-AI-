@@ -2,12 +2,13 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { Readable } from 'node:stream';
+import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { isValidStorageKey } from './naming';
 import { guessMime } from './mime';
 import { AppError, NotFoundError, ValidationError } from '@/lib/errors';
 import { logger } from '@/lib/logger';
+import { getEncryptionKey } from '@/lib/encryption';
 
 export interface StoredObjectMetadata {
   storageKey: string;
@@ -21,6 +22,7 @@ export interface StorageReadResult {
   size: number;
   mimeType: string;
   sha256?: string;
+  isEncrypted?: boolean;
 }
 
 export class StorageSecurityError extends AppError {
@@ -29,6 +31,10 @@ export class StorageSecurityError extends AppError {
     this.name = 'StorageSecurityError';
   }
 }
+
+// Magic bytes identifier for authenticated AES-256-GCM encrypted document container
+const MAGIC_HEADER = Buffer.from('MM_ENC02'); // 8 bytes
+const HEADER_SIZE = 36; // 8 bytes magic + 12 bytes nonce + 16 bytes auth tag
 
 export class LocalStorageDriver {
   private readonly customStorageDir?: string;
@@ -95,7 +101,7 @@ export class LocalStorageDriver {
   }
 
   /**
-   * Initializes storage directories with restrictive permissions.
+   * Initializes storage directories with restrictive permissions (0700).
    */
   public async init(): Promise<void> {
     await fsp.mkdir(this.storageRoot, { recursive: true, mode: 0o700 });
@@ -103,7 +109,9 @@ export class LocalStorageDriver {
   }
 
   /**
-   * Writes a stream to private storage atomically using a temporary file.
+   * Writes a stream to private storage atomically using authenticated AES-256-GCM encryption at rest.
+   * Stored format: [8-byte MAGIC "MM_ENC02"] + [12-byte Nonce] + [16-byte AuthTag] + [Ciphertext]
+   * Decouples client filenames, enforces boundary checks, and ensures no plaintext is ever written to disk.
    */
   public async writeStream(
     storageKey: string,
@@ -129,6 +137,21 @@ export class LocalStorageDriver {
     const tempFileName = `${crypto.randomUUID()}.tmp`;
     const tempFilePath = path.join(this.tempDir, tempFileName);
 
+    // Cryptographic initialization
+    const key = getEncryptionKey();
+    const nonce = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, nonce);
+    // Bind storage key as AAD to prevent document swapping/relocation attacks
+    cipher.setAAD(Buffer.from(storageKey, 'utf8'));
+
+    // Write header placeholder: MAGIC (8) + Nonce (12) + AuthTag placeholder (16)
+    const headerPlaceholder = Buffer.concat([
+      MAGIC_HEADER,
+      nonce,
+      Buffer.alloc(16), // Placeholder for 16-byte GCM auth tag
+    ]);
+    await fsp.writeFile(tempFilePath, headerPlaceholder, { mode: 0o600, flag: 'wx' });
+
     let bytesWritten = 0;
     const hash = crypto.createHash('sha256');
 
@@ -142,38 +165,57 @@ export class LocalStorageDriver {
       nodeReadable = sourceStream as Readable;
     }
 
-    const writeStream = fs.createWriteStream(tempFilePath, {
-      flags: 'wx', // exclusive write: fail if already exists
-      mode: 0o600, // owner read/write only
+    // Open append stream for ciphertext payload
+    const writeCipherStream = fs.createWriteStream(tempFilePath, {
+      flags: 'a',
+      mode: 0o600,
+    });
+
+    const encryptTransform = new Transform({
+      transform(chunk: Buffer, _encoding, callback) {
+        bytesWritten += chunk.length;
+        if (maxBytes !== undefined && bytesWritten > maxBytes) {
+          callback(new ValidationError(`Upload size exceeded maximum allowed limit of ${maxBytes} bytes`));
+          return;
+        }
+        hash.update(chunk);
+        try {
+          const enc = cipher.update(chunk);
+          callback(null, enc);
+        } catch (err) {
+          callback(err as Error);
+        }
+      },
+      flush(callback) {
+        try {
+          const finalChunk = cipher.final();
+          callback(null, finalChunk);
+        } catch (err) {
+          callback(err as Error);
+        }
+      },
     });
 
     try {
-      nodeReadable.on('data', (chunk: Buffer) => {
-        bytesWritten += chunk.length;
-        if (maxBytes !== undefined && bytesWritten > maxBytes) {
-          nodeReadable.destroy(new ValidationError(`Upload size exceeded maximum allowed limit of ${maxBytes} bytes`));
-        }
-        hash.update(chunk);
-      });
+      await pipeline(nodeReadable, encryptTransform, writeCipherStream);
 
-      await pipeline(nodeReadable, writeStream);
-
-      // Verify file is a regular file and non-empty
-      const stat = await fsp.stat(tempFilePath);
-      if (!stat.isFile()) {
-        throw new StorageSecurityError('Uploaded object is not a regular file');
-      }
-
-      // Explicitly flush file data and directory metadata to durable storage prior to publication
+      // Extract authentication tag and patch it into header at offset 20
+      const authTag = cipher.getAuthTag();
       const fileHandle = await fsp.open(tempFilePath, 'r+');
       try {
+        await fileHandle.write(authTag, 0, 16, 20);
         await fileHandle.sync();
       } finally {
         await fileHandle.close();
       }
 
+      // Verify file is a regular file
+      const stat = await fsp.stat(tempFilePath);
+      if (!stat.isFile()) {
+        throw new StorageSecurityError('Uploaded object is not a regular file');
+      }
+
       // Atomically publish the temporary file exclusively (create-if-absent)
-      // Hard linking ensures that if targetPath already exists, publication fails atomically with EEXIST rather than overwriting
       try {
         await fsp.link(tempFilePath, targetPath);
         await fsp.unlink(tempFilePath);
@@ -182,8 +224,6 @@ export class LocalStorageDriver {
         if (err.code === 'EEXIST') {
           throw new StorageSecurityError(`Storage collision: object already exists at key ${storageKey}`);
         }
-        // Fail closed on unsupported filesystem operations (EXDEV, ENOSYS, etc.)
-        // Never fall back to an unchecked exists() followed by rename(), as that opens a TOCTOU race window
         throw new StorageSecurityError(
           `Atomic storage publication failed: hard-link create-if-absent is not supported by underlying storage medium (${err.code || String(linkErr)})`
         );
@@ -199,7 +239,6 @@ export class LocalStorageDriver {
         mimeType,
       };
     } catch (error) {
-      // Clean up temporary file on any error
       try {
         await fsp.unlink(tempFilePath);
       } catch {
@@ -210,7 +249,8 @@ export class LocalStorageDriver {
   }
 
   /**
-   * Reads an existing private document stream, validating symlinks and boundaries.
+   * Reads an existing private document stream, authenticating and decrypting AES-256-GCM ciphertext on the fly.
+   * Backward-compatible with legacy unencrypted objects during migration.
    */
   public async readStream(storageKey: string): Promise<StorageReadResult> {
     const targetPath = this.resolveSecurePath(storageKey);
@@ -239,14 +279,101 @@ export class LocalStorageDriver {
       throw new StorageSecurityError('Symlink destination outside storage root blocked');
     }
 
-    const stream = fs.createReadStream(realPath);
     const mimeType = guessMime(realPath);
 
+    // Read header to check for authenticated encrypted container
+    if (stat.size >= HEADER_SIZE) {
+      const headerBuf = Buffer.alloc(HEADER_SIZE);
+      const fh = await fsp.open(realPath, 'r');
+      let bytesRead = 0;
+      try {
+        const res = await fh.read(headerBuf, 0, HEADER_SIZE, 0);
+        bytesRead = res.bytesRead;
+      } finally {
+        await fh.close();
+      }
+
+      if (bytesRead >= HEADER_SIZE && headerBuf.subarray(0, 8).equals(MAGIC_HEADER)) {
+        const nonce = headerBuf.subarray(8, 20);
+        const authTag = headerBuf.subarray(20, 36);
+
+        const key = getEncryptionKey();
+        const decipher = crypto.createDecipheriv('aes-256-gcm', key, nonce);
+        decipher.setAAD(Buffer.from(storageKey, 'utf8'));
+        decipher.setAuthTag(authTag);
+
+        const cipherStream = fs.createReadStream(realPath, { start: HEADER_SIZE });
+        const decryptedStream = cipherStream.pipe(decipher);
+
+        return {
+          stream: decryptedStream,
+          size: stat.size - HEADER_SIZE,
+          mimeType,
+          isEncrypted: true,
+        };
+      }
+    }
+
+    // Legacy unencrypted stream backward compatibility
+    const stream = fs.createReadStream(realPath);
     return {
       stream,
       size: stat.size,
       mimeType,
+      isEncrypted: false,
     };
+  }
+
+  /**
+   * Reads and decrypts an entire document into memory as a plaintext Buffer.
+   * Verifies GCM authentication tag before resolving.
+   */
+  public async readBuffer(storageKey: string): Promise<Buffer> {
+    const { stream } = await this.readStream(storageKey);
+    const chunks: Buffer[] = [];
+
+    return new Promise((resolve, reject) => {
+      stream.on('data', (chunk: Buffer) => chunks.push(chunk));
+      stream.on('end', () => resolve(Buffer.concat(chunks)));
+      stream.on('error', (err: Error) => {
+        reject(
+          new StorageSecurityError(
+            `Cryptographic authentication failed: document ciphertext on disk has been tampered with or corrupted (${err.message})`
+          )
+        );
+      });
+    });
+  }
+
+  /**
+   * Decrypts document stream to a short-lived temporary file with restrictive permissions (0600)
+   * within private storage .tmp directory, executes the provided worker callback, and cleans up
+   * the temporary plaintext file deterministically in a finally block.
+   */
+  public async withDecryptedTempFile<T>(
+    storageKey: string,
+    fn: (tempPlaintextPath: string) => Promise<T>
+  ): Promise<T> {
+    await this.init();
+    const tempFileName = `${crypto.randomUUID()}_plain.tmp`;
+    const tempPlaintextPath = path.join(this.tempDir, tempFileName);
+
+    const { stream } = await this.readStream(storageKey);
+    const writeStream = fs.createWriteStream(tempPlaintextPath, {
+      flags: 'wx',
+      mode: 0o600,
+    });
+
+    try {
+      await pipeline(stream, writeStream);
+      return await fn(tempPlaintextPath);
+    } finally {
+      try {
+        await fsp.unlink(tempPlaintextPath);
+      } catch {
+        // Ignore deletion error if file does not exist
+      }
+    }
   }
 
   /**

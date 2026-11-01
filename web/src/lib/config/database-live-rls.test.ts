@@ -1477,6 +1477,45 @@ describe('PostgreSQL Live Authentication, RLS & Role Privilege Verification (Che
       }
     });
 
+    it('verifies connected database identity is open-health and runtime user is medimate_app (Checkpoint 5D.23 Part G)', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      const res = await prisma.$queryRawUnsafe<Array<{ current_user: string; current_database: string }>>(
+        'SELECT current_user, current_database();'
+      );
+
+      expect(res).toBeDefined();
+      expect(res.length).toBe(1);
+      expect(res[0].current_user).toBe('medimate_app');
+      expect(res[0].current_database).toBe('open-health');
+    });
+
+    it('verifies non-canonical and hallucinated tables (DocumentAuditLog, HealthDataFile, MedicalProfile, UserConsents) do not exist', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      const unexpectedTables = [
+        'DocumentAuditLog',
+        'HealthDataFile',
+        'MedicalProfile',
+        'UserConsents',
+      ];
+
+      const res = await prisma.$queryRawUnsafe<Array<{ tablename: string }>>(`
+        SELECT tablename 
+        FROM pg_catalog.pg_tables 
+        WHERE schemaname = 'public' 
+          AND tablename IN (${unexpectedTables.map((t) => `'${t}'`).join(', ')});
+      `);
+
+      expect(res).toHaveLength(0);
+    });
+
     it('verifies every _owner_all policy has explicit USING (true) and WITH CHECK (true) targeting medimate_owner', async (ctx) => {
       if (!isPostgresLive) {
         ctx.skip();

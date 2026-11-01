@@ -47,8 +47,7 @@ interface InferenceOptions {
 
 async function loadFileBuffer(filePath: string): Promise<Buffer> {
     if (isValidStorageKey(filePath)) {
-        const diskPath = await localStorageDriver.getValidatedDiskPath(filePath);
-        return await fsp.readFile(diskPath);
+        return await localStorageDriver.readBuffer(filePath);
     }
     if (path.isAbsolute(filePath) && fs.existsSync(filePath)) {
         return await fsp.readFile(filePath);
@@ -57,24 +56,26 @@ async function loadFileBuffer(filePath: string): Promise<Buffer> {
 }
 
 async function documentOCR({document, documentParser}: { document: string, documentParser: DocumentParserOptions }) {
-    let resolvedDoc = document;
+    // If document is stored in private storage, decrypt to short-lived temp file for OCR
     if (isValidStorageKey(document)) {
-        resolvedDoc = await localStorageDriver.getValidatedDiskPath(document);
+        return await localStorageDriver.withDecryptedTempFile(document, async (tempPath) => {
+            return await runParserOcr(tempPath, documentParser);
+        });
     }
 
-    // Get the document parser
-    const parser = documents.find(e => e.name === documentParser.parser)
-    if (!parser) throw new Error('Invalid document parser')
+    return await runParserOcr(document, documentParser);
+}
 
-    // Get the ocr result
-    const models = await parser.models()
-    const model = models.find(e => e.id === documentParser.model)
-    if (!model) throw new Error('Invalid document parser model')
+async function runParserOcr(inputPath: string, documentParser: DocumentParserOptions) {
+    const parser = documents.find(e => e.name === documentParser.parser);
+    if (!parser) throw new Error('Invalid document parser');
 
-    // Get the ocr result
-    const {ocr} = await parser.ocr({input: resolvedDoc, model: model, apiKey: documentParser.apiKey})
+    const models = await parser.models();
+    const model = models.find(e => e.id === documentParser.model);
+    if (!model) throw new Error('Invalid document parser model');
 
-    return ocr
+    const {ocr} = await parser.ocr({input: inputPath, model: model, apiKey: documentParser.apiKey});
+    return ocr;
 }
 
 async function documentParse({document, documentParser}: {

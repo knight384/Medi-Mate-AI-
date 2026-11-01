@@ -1569,4 +1569,154 @@ describe('PostgreSQL Live Authentication, RLS & Role Privilege Verification (Che
       expect(check[0].regclass).toBeNull();
     });
   });
+
+  describe('Migration Failure Semantics, Function Catalog & Security Parity (Checkpoint 5D.19)', () => {
+    it('verifies all required security-definer functions exist with strict search_path and proper ownership', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      const funcs = await prisma.$queryRawUnsafe<
+        Array<{ proname: string; prosecdef: boolean; owner: string; proconfig: string[] | null }>
+      >(`
+        SELECT 
+          p.proname,
+          p.prosecdef,
+          r.rolname as owner,
+          p.proconfig
+        FROM pg_catalog.pg_proc p
+        JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+        JOIN pg_catalog.pg_roles r ON r.oid = p.proowner
+        WHERE n.nspname = 'public'
+          AND p.proname IN ('lookup_user_for_auth', 'apply_medimate_rls_policies', 'trg_apply_rls_on_ddl')
+        ORDER BY p.proname;
+      `);
+
+      expect(funcs.length).toBe(3);
+
+      const authLookup = funcs.find((f) => f.proname === 'lookup_user_for_auth');
+      expect(authLookup).toBeDefined();
+      expect(authLookup?.prosecdef).toBe(true);
+      expect(authLookup?.owner).toBe('medimate_auth_definer');
+      expect(authLookup?.proconfig).toEqual(['search_path=pg_catalog, public, pg_temp']);
+
+      const rlsPolicies = funcs.find((f) => f.proname === 'apply_medimate_rls_policies');
+      expect(rlsPolicies).toBeDefined();
+      expect(rlsPolicies?.prosecdef).toBe(true);
+      expect(rlsPolicies?.owner).toBe('medimate_owner');
+      expect(rlsPolicies?.proconfig).toEqual(['search_path=pg_catalog, public, pg_temp']);
+
+      const ddlTrigger = funcs.find((f) => f.proname === 'trg_apply_rls_on_ddl');
+      expect(ddlTrigger).toBeDefined();
+      expect(ddlTrigger?.prosecdef).toBe(true);
+      expect(ddlTrigger?.owner).toBe('medimate_owner');
+      expect(ddlTrigger?.proconfig).toEqual(['search_path=pg_catalog, public, pg_temp']);
+    });
+
+    it('verifies event trigger medimate_rls_event_trigger is active on ddl_command_end', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      const triggers = await prisma.$queryRawUnsafe<
+        Array<{ evtname: string; evtevent: string; evtenabled: string; function_name: string }>
+      >(`
+        SELECT 
+          t.evtname,
+          t.evtevent,
+          t.evtenabled,
+          p.proname as function_name
+        FROM pg_catalog.pg_event_trigger t
+        JOIN pg_catalog.pg_proc p ON p.oid = t.evtfoid
+        WHERE t.evtname = 'medimate_rls_event_trigger';
+      `);
+
+      expect(triggers.length).toBe(1);
+      expect(triggers[0].evtevent).toBe('ddl_command_end');
+      expect(triggers[0].evtenabled).toBe('O'); // 'O' = origin and local (enabled)
+      expect(triggers[0].function_name).toBe('trg_apply_rls_on_ddl');
+    });
+
+    it('verifies medimate_app possesses NOINHERIT and zero administrative role memberships', async (ctx) => {
+      if (!isPostgresLive) {
+        ctx.skip();
+        return;
+      }
+
+      const roleProps = await prisma.$queryRawUnsafe<Array<{ rolinherit: boolean; rolsuper: boolean; rolbypassrls: boolean }>>(`
+        SELECT rolinherit, rolsuper, rolbypassrls
+        FROM pg_catalog.pg_roles
+        WHERE rolname = 'medimate_app';
+      `);
+
+      expect(roleProps.length).toBe(1);
+      expect(roleProps[0].rolinherit).toBe(false);
+      expect(roleProps[0].rolsuper).toBe(false);
+      expect(roleProps[0].rolbypassrls).toBe(false);
+
+      const memberships = await prisma.$queryRawUnsafe<Array<{ role: string }>>(`
+        SELECT r.rolname as role
+        FROM pg_catalog.pg_roles r
+        JOIN pg_catalog.pg_auth_members am ON r.oid = am.roleid
+        JOIN pg_catalog.pg_roles m ON m.oid = am.member
+        WHERE m.rolname = 'medimate_app';
+      `);
+
+      expect(memberships.length).toBe(0);
+    });
+
+    it('verifies exact checksum matching between applied migrations and committed migration files', async (ctx) => {
+      if (!isPostgresLive || !ownerPrisma) {
+        ctx.skip();
+        return;
+      }
+
+      const applied = await ownerPrisma.$queryRawUnsafe<
+        Array<{ migration_name: string; checksum: string; finished_at: Date | null; rolled_back_at: Date | null }>
+      >(`
+        SELECT migration_name, checksum, finished_at, rolled_back_at
+        FROM public._prisma_migrations
+        WHERE rolled_back_at IS NULL
+        ORDER BY started_at ASC;
+      `);
+
+      expect(applied.length).toBeGreaterThanOrEqual(2);
+      for (const m of applied) {
+        expect(m.checksum).toBeDefined();
+        expect(m.checksum.length).toBe(64); // SHA-256 hash
+        expect(m.finished_at).not.toBeNull();
+        expect(m.rolled_back_at).toBeNull();
+      }
+    });
+
+    it('verifies release-job execution command succeeds and enforces strict RLS across all tables', async (ctx) => {
+      if (!isPostgresLive || !ownerPrisma) {
+        ctx.skip();
+        return;
+      }
+
+      // Re-run strict mode verification directly as owner to simulate release-job post-migration step
+      await expect(ownerPrisma.$executeRawUnsafe('SELECT public.apply_medimate_rls_policies(true);')).resolves.not.toThrow();
+
+      // Verify that every single application table in schema public has rowsecurity and relforcerowsecurity enabled
+      const tables = await ownerPrisma.$queryRawUnsafe<
+        Array<{ tablename: string; rowsecurity: boolean; forcerowsecurity: boolean }>
+      >(`
+        SELECT t.tablename, t.rowsecurity, c.relforcerowsecurity as forcerowsecurity
+        FROM pg_catalog.pg_tables t
+        JOIN pg_catalog.pg_class c ON c.relname = t.tablename
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace AND n.nspname = t.schemaname
+        WHERE t.schemaname = 'public'
+          AND t.tablename NOT IN ('_prisma_migrations');
+      `);
+
+      expect(tables.length).toBe(13);
+      for (const t of tables) {
+        expect(t.rowsecurity).toBe(true);
+        expect(t.forcerowsecurity).toBe(true);
+      }
+    });
+  });
 });

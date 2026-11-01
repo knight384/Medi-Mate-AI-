@@ -194,11 +194,11 @@ describe('Database Multi-Tenant Isolation & RLS Infrastructure', () => {
       expect(content).toContain("ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC");
     });
 
-    it('verifies 02-init-rls.sql defines security definer lookup_user_for_auth function with hardened search_path (Task B)', async () => {
+    it('verifies 02-init-rls.sql defines security definer lookup_user_for_auth function with hardened search_path (Part A)', async () => {
       const content = await fsp.readFile(initRlsPath, 'utf-8');
       expect(content).toContain('CREATE OR REPLACE FUNCTION public.lookup_user_for_auth');
       expect(content).toContain('SECURITY DEFINER');
-      expect(content).toContain("SET search_path = ''");
+      expect(content).toContain('SET search_path = public, pg_catalog, pg_temp');
       expect(content).toContain('FROM public."User" u');
       expect(content).toContain('OWNER TO medimate_auth_definer');
     });
@@ -213,10 +213,10 @@ describe('Database Multi-Tenant Isolation & RLS Infrastructure', () => {
 
     it('verifies 02-init-rls.sql sets hardened search_path on policy and trigger functions', async () => {
       const content = await fsp.readFile(initRlsPath, 'utf-8');
-      expect(content).toContain("CREATE OR REPLACE FUNCTION public.apply_medimate_rls_policies()");
+      expect(content).toContain("CREATE OR REPLACE FUNCTION public.apply_medimate_rls_policies(p_strict boolean DEFAULT false)");
       expect(content).toContain("CREATE OR REPLACE FUNCTION public.trg_apply_rls_on_ddl()");
-      expect(content).toContain("REVOKE EXECUTE ON FUNCTION public.apply_medimate_rls_policies() FROM PUBLIC");
-      expect(content).toContain("REVOKE EXECUTE ON FUNCTION public.trg_apply_rls_on_ddl() FROM PUBLIC");
+      expect(content).toContain("REVOKE ALL ON FUNCTION public.apply_medimate_rls_policies(boolean) FROM PUBLIC");
+      expect(content).toContain("REVOKE ALL ON FUNCTION public.trg_apply_rls_on_ddl() FROM PUBLIC");
     });
 
     it('verifies 02-init-rls.sql uses physical column names for OAuth tables (user_id) (Task D)', async () => {
@@ -288,6 +288,22 @@ describe('Database Multi-Tenant Isolation & RLS Infrastructure', () => {
       expect(content).toContain('CREATE EVENT TRIGGER medimate_rls_event_trigger');
       expect(content).toContain('ON ddl_command_end');
       expect(content).toContain("WHEN TAG IN ('CREATE TABLE', 'CREATE TABLE AS')");
+    });
+
+    it('verifies 02-init-rls.sql supports strict mode post-migration table verification (Part B)', async () => {
+      const content = await fsp.readFile(initRlsPath, 'utf-8');
+      expect(content).toContain('v_expected_tables text[] := ARRAY[');
+      expect(content).toContain("'User'");
+      expect(content).toContain("'HealthData'");
+      expect(content).toContain("'ChatRoom'");
+      expect(content).toContain('IF p_strict THEN');
+      expect(content).toContain('RAISE EXCEPTION \'MediMate AI RLS verification failed: Required table public."%" does not exist\'');
+    });
+
+    it('verifies prisma/post-migration-rls.ts invokes apply_medimate_rls_policies in strict mode (Part B)', async () => {
+      const postMigrationPath = path.resolve(__dirname, '../../../prisma/post-migration-rls.ts');
+      const content = await fsp.readFile(postMigrationPath, 'utf-8');
+      expect(content).toContain('SELECT public.apply_medimate_rls_policies(true);');
     });
   });
 });

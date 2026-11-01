@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run --no-file-parallelism",
     "test:watch": "vitest",
+    "db:init-rls": "ts-node --compiler-options {\"module\":\"CommonJS\"} prisma/post-migration-rls.ts",
     "validate": "npm run typecheck && npm run lint && npm run test",
     "deploy:trigger-prod": "npx trigger.dev@3.3.16 deploy"
   },

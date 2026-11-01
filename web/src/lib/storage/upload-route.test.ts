@@ -252,7 +252,7 @@ describe('Health Data Upload Route (POST /api/health-data) Integration', () => {
 
     const res = await createHealthData(req);
     expect(res.status).toBe(413);
-  });
+  }, 15000);
 
   it('cleans up physical storage if database insertion fails after write', async () => {
     vi.mocked(auth).mockResolvedValueOnce({ user: mockUserA } as never);

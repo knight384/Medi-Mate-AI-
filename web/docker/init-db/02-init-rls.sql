@@ -3,53 +3,80 @@
 -- Enforces fail-closed isolation: missing or unauthenticated context denies all access.
 
 -- 1. Pre-authentication lookup function (SECURITY DEFINER)
--- Hardened with search_path = '' to prevent schema poisoning attacks.
--- Owned by dedicated 'medimate_auth_definer' role which possesses BYPASSRLS.
--- This safely resolves the interaction between FORCE ROW LEVEL SECURITY on "User" and
--- pre-authentication credential verification without granting BYPASSRLS to runtime roles.
-CREATE OR REPLACE FUNCTION public.lookup_user_for_auth(p_username text)
-RETURNS TABLE (id text, password text)
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = ''
-AS $$
+-- Atomically created, ownership assigned to medimate_auth_definer, execution revoked from PUBLIC
+-- search_path is explicitly configured with trusted schemas and pg_temp last (Task A).
+-- Parameterized SQL ensures no dynamic SQL injection vulnerabilities.
+DO $init_auth_fn$
 BEGIN
-    RETURN QUERY
-        SELECT u.id, u.password
-        FROM public."User" u
-        WHERE u.username = p_username
-        LIMIT 1;
-END;
-$$;
+    CREATE OR REPLACE FUNCTION public.lookup_user_for_auth(p_username text)
+    RETURNS TABLE (id text, password text)
+    LANGUAGE plpgsql
+    SECURITY DEFINER
+    SET search_path = public, pg_catalog, pg_temp
+    AS $$
+    BEGIN
+        RETURN QUERY
+            SELECT u.id, u.password
+            FROM public."User" u
+            WHERE u.username = p_username
+            LIMIT 1;
+    END;
+    $$;
 
--- Restrict execution: revoke from PUBLIC, grant exclusively to app runtime role
-REVOKE EXECUTE ON FUNCTION public.lookup_user_for_auth(text) FROM PUBLIC;
+    -- Revoke execute from PUBLIC and all unauthorized roles atomically
+    REVOKE ALL ON FUNCTION public.lookup_user_for_auth(text) FROM PUBLIC;
 
-DO $auth_setup$
-BEGIN
     -- Assign function ownership to dedicated auth definer role if available
     IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_auth_definer') THEN
         ALTER FUNCTION public.lookup_user_for_auth(text) OWNER TO medimate_auth_definer;
     END IF;
 
-    -- Grant execution privilege to application runtime role
+    -- Grant execution privilege exclusively to application runtime role
     IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_app') THEN
         GRANT EXECUTE ON FUNCTION public.lookup_user_for_auth(text) TO medimate_app;
     END IF;
-END
-$auth_setup$;
+END;
+$init_auth_fn$;
 
--- 2. Core RLS Policy Application Function
--- Hardened with SECURITY DEFINER and search_path = ''
-CREATE OR REPLACE FUNCTION public.apply_medimate_rls_policies()
+-- 2. Core RLS Policy & Column Permission Management Function
+-- Hardened with SECURITY DEFINER and search_path = public, pg_catalog, pg_temp
+-- Supports lenient mode (p_strict = false) for DDL trigger on initial cluster setup,
+-- and strict mode (p_strict = true) for post-migration verification (Task B).
+CREATE OR REPLACE FUNCTION public.apply_medimate_rls_policies(p_strict boolean DEFAULT false)
 RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = ''
+SET search_path = public, pg_catalog, pg_temp
 AS $rls$
 DECLARE
     r record;
+    v_tab text;
+    v_pol text;
+    v_expected_tables text[] := ARRAY[
+        'User',
+        'HealthData',
+        'ChatRoom',
+        'ChatMessage',
+        'AssistantMode',
+        'AssistantModeContext',
+        'LLMProvider',
+        'OAuth2Client',
+        'OAuth2AuthorizationCode',
+        'OAuth2Token',
+        'RedditAccessToken',
+        'RedditPost',
+        'RedditPostComment'
+    ];
 BEGIN
+    -- Strict mode validation: fail visibly if any required clinical/security table is missing (Task B)
+    IF p_strict THEN
+        FOREACH v_tab IN ARRAY v_expected_tables LOOP
+            IF NOT EXISTS (SELECT FROM pg_catalog.pg_tables WHERE schemaname = 'public' AND tablename = v_tab) THEN
+                RAISE EXCEPTION 'MediMate AI RLS verification failed: Required table public."%" does not exist', v_tab;
+            END IF;
+        END LOOP;
+    END IF;
+
     -- Fail-closed default: Enable and FORCE RLS on every public table (except Prisma migration ledger)
     -- Any newly created table without an explicit policy is immediately locked down (deny-all).
     FOR r IN (
@@ -62,7 +89,7 @@ BEGIN
         EXECUTE format('ALTER TABLE public.%I FORCE ROW LEVEL SECURITY', r.tablename);
     END LOOP;
 
-    -- Task I: Ensure _prisma_migrations is completely inaccessible to application runtime and PUBLIC
+    -- Task I: Ensure _prisma_migrations is completely excluded from RLS and inaccessible to medimate_app
     IF EXISTS (SELECT FROM pg_catalog.pg_tables WHERE schemaname = 'public' AND tablename = '_prisma_migrations') THEN
         EXECUTE 'REVOKE ALL ON TABLE public._prisma_migrations FROM PUBLIC';
         IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_app') THEN
@@ -232,6 +259,21 @@ BEGIN
         CREATE POLICY user_self_delete ON public."User"
             FOR DELETE
             USING (id = pg_catalog.current_setting('app.current_user_id', true));
+
+        -- Enforce column-level least privilege on User table dynamically whenever created/verified
+        IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_app') THEN
+            EXECUTE 'REVOKE INSERT ON TABLE public."User" FROM medimate_app';
+            EXECUTE 'GRANT INSERT (id, username, password, "hasOnboarded", "createdAt", "updatedAt") ON TABLE public."User" TO medimate_app';
+            EXECUTE 'REVOKE UPDATE ON TABLE public."User" FROM medimate_app';
+            EXECUTE 'GRANT UPDATE (name, password, "hasOnboarded", "updatedAt") ON TABLE public."User" TO medimate_app';
+            EXECUTE 'REVOKE SELECT ON TABLE public."User" FROM medimate_app';
+            EXECUTE 'GRANT SELECT (id, name, username, "hasOnboarded", "createdAt", "updatedAt") ON TABLE public."User" TO medimate_app';
+        END IF;
+
+        IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_auth_definer') THEN
+            EXECUTE 'REVOKE ALL ON TABLE public."User" FROM medimate_auth_definer';
+            EXECUTE 'GRANT SELECT (id, username, password) ON TABLE public."User" TO medimate_auth_definer';
+        END IF;
     END IF;
 
     -- 11. RedditAccessToken (Restricted system tokens)
@@ -253,6 +295,13 @@ BEGIN
             END IF;
         END
         $worker_policy$;
+
+        IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_app') THEN
+            EXECUTE 'REVOKE ALL ON TABLE public."RedditAccessToken" FROM medimate_app';
+        END IF;
+        IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_reddit_worker') THEN
+            EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public."RedditAccessToken" TO medimate_reddit_worker';
+        END IF;
     END IF;
 
     -- 12. RedditPost and RedditPostComment (Worker synchronization tables)
@@ -270,6 +319,13 @@ BEGIN
             END IF;
         END
         $post_worker_policy$;
+
+        IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_app') THEN
+            EXECUTE 'REVOKE ALL ON TABLE public."RedditPost" FROM medimate_app';
+        END IF;
+        IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_reddit_worker') THEN
+            EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public."RedditPost" TO medimate_reddit_worker';
+        END IF;
     END IF;
 
     IF EXISTS (SELECT FROM pg_catalog.pg_tables WHERE schemaname = 'public' AND tablename = 'RedditPostComment') THEN
@@ -285,30 +341,62 @@ BEGIN
             END IF;
         END
         $comment_worker_policy$;
+
+        IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_app') THEN
+            EXECUTE 'REVOKE ALL ON TABLE public."RedditPostComment" FROM medimate_app';
+        END IF;
+        IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_reddit_worker') THEN
+            EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public."RedditPostComment" TO medimate_reddit_worker';
+        END IF;
+    END IF;
+
+    -- Strict mode policy verification: fail visibly if any expected policy is missing
+    IF p_strict THEN
+        IF NOT EXISTS (SELECT FROM pg_catalog.pg_policies WHERE schemaname = 'public' AND tablename = 'User' AND policyname = 'user_auth_definer_select') THEN
+            RAISE EXCEPTION 'MediMate AI RLS verification failed: Policy user_auth_definer_select on User is missing';
+        END IF;
+        IF NOT EXISTS (SELECT FROM pg_catalog.pg_policies WHERE schemaname = 'public' AND tablename = 'HealthData' AND policyname = 'health_data_tenant_isolation') THEN
+            RAISE EXCEPTION 'MediMate AI RLS verification failed: Policy health_data_tenant_isolation on HealthData is missing';
+        END IF;
+        IF NOT EXISTS (SELECT FROM pg_catalog.pg_policies WHERE schemaname = 'public' AND tablename = 'ChatRoom' AND policyname = 'chat_room_tenant_isolation') THEN
+            RAISE EXCEPTION 'MediMate AI RLS verification failed: Policy chat_room_tenant_isolation on ChatRoom is missing';
+        END IF;
+        IF NOT EXISTS (SELECT FROM pg_catalog.pg_policies WHERE schemaname = 'public' AND tablename = 'ChatMessage' AND policyname = 'chat_message_tenant_isolation') THEN
+            RAISE EXCEPTION 'MediMate AI RLS verification failed: Policy chat_message_tenant_isolation on ChatMessage is missing';
+        END IF;
     END IF;
 END;
 $rls$;
 
--- Revoke execute on management function from PUBLIC
-REVOKE EXECUTE ON FUNCTION public.apply_medimate_rls_policies() FROM PUBLIC;
+-- Revoke execute on policy management function from PUBLIC
+REVOKE ALL ON FUNCTION public.apply_medimate_rls_policies(boolean) FROM PUBLIC;
 
--- Execute immediately to apply policies to any existing tables
-SELECT public.apply_medimate_rls_policies();
+-- Grant execute on policy management function to schema owner
+DO $owner_grant$
+BEGIN
+    IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_owner') THEN
+        GRANT EXECUTE ON FUNCTION public.apply_medimate_rls_policies(boolean) TO medimate_owner;
+    END IF;
+END
+$owner_grant$;
+
+-- Execute bootstrap policy application in non-strict mode (safe for empty data directory)
+SELECT public.apply_medimate_rls_policies(false);
 
 -- Create event trigger to automatically apply RLS whenever new tables are created via Prisma DDL
 CREATE OR REPLACE FUNCTION public.trg_apply_rls_on_ddl()
 RETURNS event_trigger
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = ''
+SET search_path = public, pg_catalog, pg_temp
 AS $$
 BEGIN
-    PERFORM public.apply_medimate_rls_policies();
+    PERFORM public.apply_medimate_rls_policies(false);
 END;
 $$;
 
 -- Revoke execute on trigger function from PUBLIC
-REVOKE EXECUTE ON FUNCTION public.trg_apply_rls_on_ddl() FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.trg_apply_rls_on_ddl() FROM PUBLIC;
 
 DROP EVENT TRIGGER IF EXISTS medimate_rls_event_trigger;
 CREATE EVENT TRIGGER medimate_rls_event_trigger

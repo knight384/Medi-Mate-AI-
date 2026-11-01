@@ -18,4 +18,4 @@ RUN npm run build && \
 
 USER ohuser
 EXPOSE 3000
-ENTRYPOINT ["sh", "-c", "if [ \"$DEPLOYMENT_ENV\" = \"local\" ]; then npx prisma db push && npx prisma db seed; fi && exec npm start"]
+ENTRYPOINT ["sh", "-c", "if [ \"$DEPLOYMENT_ENV\" = \"local\" ]; then npx prisma db push && npm run db:init-rls && npx prisma db seed; fi && exec npm start"]

@@ -136,11 +136,10 @@ describe('Database Multi-Tenant Isolation & RLS Infrastructure', () => {
       expect(content).toContain('-v app_pass="$APP_PASS"');
     });
 
-    it('verifies 01-init-roles.sh creates dedicated internal medimate_auth_definer role with BYPASSRLS', async () => {
+    it('verifies 01-init-roles.sh creates dedicated internal medimate_auth_definer role with NOBYPASSRLS (Task D)', async () => {
       const content = await fsp.readFile(initRolesPath, 'utf-8');
-      expect(content).toContain("CREATE ROLE medimate_auth_definer NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE BYPASSRLS");
+      expect(content).toContain("CREATE ROLE medimate_auth_definer NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS");
       expect(content).toContain("GRANT USAGE ON SCHEMA public TO medimate_auth_definer");
-      expect(content).toContain("GRANT SELECT ON ALL TABLES IN SCHEMA public TO medimate_auth_definer");
     });
 
     it('verifies 01-init-roles.sh creates dedicated worker role medimate_reddit_worker with NOBYPASSRLS (Task A)', async () => {
@@ -161,6 +160,14 @@ describe('Database Multi-Tenant Isolation & RLS Infrastructure', () => {
       const content = await fsp.readFile(initRolesPath, 'utf-8');
       expect(content).toContain('REVOKE UPDATE ON TABLE public."User" FROM %I');
       expect(content).toContain('GRANT UPDATE (name, password, "hasOnboarded", "updatedAt") ON TABLE public."User" TO %I');
+    });
+
+    it('verifies 01-init-roles.sh restricts User table SELECT to non-secret columns for app role and password to auth definer (Task E)', async () => {
+      const content = await fsp.readFile(initRolesPath, 'utf-8');
+      expect(content).toContain('REVOKE SELECT ON TABLE public."User" FROM %I');
+      expect(content).toContain('GRANT SELECT (id, name, username, "hasOnboarded", "createdAt", "updatedAt") ON TABLE public."User" TO %I');
+      expect(content).toContain('REVOKE ALL ON TABLE public."User" FROM medimate_auth_definer');
+      expect(content).toContain('GRANT SELECT (id, username, password) ON TABLE public."User" TO medimate_auth_definer');
     });
 
     it('verifies 01-init-roles.sh uses dynamic SQL format(%I, %L) to safely escape identifiers and literals', async () => {
@@ -233,6 +240,25 @@ describe('Database Multi-Tenant Isolation & RLS Infrastructure', () => {
       expect(content).toContain('length(password) >= 20');
       expect(content).toContain('CREATE POLICY user_self_select ON public."User"');
       expect(content).toContain('USING (id = pg_catalog.current_setting(\'app.current_user_id\', true))');
+    });
+
+    it('verifies 02-init-rls.sql defines dedicated user_auth_definer_select policy specifically TO medimate_auth_definer (Task D)', async () => {
+      const content = await fsp.readFile(initRlsPath, 'utf-8');
+      expect(content).toContain('CREATE POLICY user_auth_definer_select ON public."User"');
+      expect(content).toContain('TO medimate_auth_definer');
+      expect(content).toContain('USING (true)');
+    });
+
+    it('verifies 02-init-rls.sql revokes all access on _prisma_migrations from PUBLIC and medimate_app (Task I)', async () => {
+      const content = await fsp.readFile(initRlsPath, 'utf-8');
+      expect(content).toContain("REVOKE ALL ON TABLE public._prisma_migrations FROM PUBLIC");
+      expect(content).toContain("REVOKE ALL ON TABLE public._prisma_migrations FROM medimate_app");
+    });
+
+    it('verifies 02-init-rls.sql isolates Reddit sync tables to medimate_reddit_worker (Task K)', async () => {
+      const content = await fsp.readFile(initRlsPath, 'utf-8');
+      expect(content).toContain('CREATE POLICY reddit_post_worker_policy ON public."RedditPost"');
+      expect(content).toContain('CREATE POLICY reddit_comment_worker_policy ON public."RedditPostComment"');
     });
 
     it('verifies 02-init-rls.sql enforces LLMProvider secret isolation for system records (Task E)', async () => {

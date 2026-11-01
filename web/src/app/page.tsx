@@ -30,7 +30,11 @@ export default async function Page() {
             redirect('/onboarding');
         } else {
             await withTenantContext(userId, async (tx) => {
-                await tx.user.update({where: {id: userId}, data: {hasOnboarded: true}});
+                await tx.user.update({
+                    where: {id: userId},
+                    data: {hasOnboarded: true},
+                    select: {id: true, hasOnboarded: true}
+                });
             });
         }
     }

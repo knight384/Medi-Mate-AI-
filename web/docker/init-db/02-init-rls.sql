@@ -62,6 +62,14 @@ BEGIN
         EXECUTE format('ALTER TABLE public.%I FORCE ROW LEVEL SECURITY', r.tablename);
     END LOOP;
 
+    -- Task I: Ensure _prisma_migrations is completely inaccessible to application runtime and PUBLIC
+    IF EXISTS (SELECT FROM pg_catalog.pg_tables WHERE schemaname = 'public' AND tablename = '_prisma_migrations') THEN
+        EXECUTE 'REVOKE ALL ON TABLE public._prisma_migrations FROM PUBLIC';
+        IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_app') THEN
+            EXECUTE 'REVOKE ALL ON TABLE public._prisma_migrations FROM medimate_app';
+        END IF;
+    END IF;
+
     -- 1. HealthData (Medical documents, clinical notes, patient observations)
     IF EXISTS (SELECT FROM pg_catalog.pg_tables WHERE schemaname = 'public' AND tablename = 'HealthData') THEN
         DROP POLICY IF EXISTS health_data_tenant_isolation ON public."HealthData";
@@ -188,7 +196,16 @@ BEGIN
     -- 10. User (Account credentials and profiles)
     -- Task C: Registration enforces safe defaults (hasOnboarded=false, bounded username/password lengths)
     -- Profile access strictly restricted to self.
+    -- Task D: Dedicated SELECT policy for medimate_auth_definer enables pre-auth lookup without global BYPASSRLS.
     IF EXISTS (SELECT FROM pg_catalog.pg_tables WHERE schemaname = 'public' AND tablename = 'User') THEN
+        DROP POLICY IF EXISTS user_auth_definer_select ON public."User";
+        IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_auth_definer') THEN
+            CREATE POLICY user_auth_definer_select ON public."User"
+                FOR SELECT
+                TO medimate_auth_definer
+                USING (true);
+        END IF;
+
         DROP POLICY IF EXISTS user_register_insert ON public."User";
         CREATE POLICY user_register_insert ON public."User"
             FOR INSERT
@@ -236,6 +253,38 @@ BEGIN
             END IF;
         END
         $worker_policy$;
+    END IF;
+
+    -- 12. RedditPost and RedditPostComment (Worker synchronization tables)
+    -- Explicitly targeted to dedicated service role TO medimate_reddit_worker.
+    IF EXISTS (SELECT FROM pg_catalog.pg_tables WHERE schemaname = 'public' AND tablename = 'RedditPost') THEN
+        DROP POLICY IF EXISTS reddit_post_worker_policy ON public."RedditPost";
+        DO $post_worker_policy$
+        BEGIN
+            IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_reddit_worker') THEN
+                CREATE POLICY reddit_post_worker_policy ON public."RedditPost"
+                    TO medimate_reddit_worker
+                    FOR ALL
+                    USING (true)
+                    WITH CHECK (true);
+            END IF;
+        END
+        $post_worker_policy$;
+    END IF;
+
+    IF EXISTS (SELECT FROM pg_catalog.pg_tables WHERE schemaname = 'public' AND tablename = 'RedditPostComment') THEN
+        DROP POLICY IF EXISTS reddit_comment_worker_policy ON public."RedditPostComment";
+        DO $comment_worker_policy$
+        BEGIN
+            IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_reddit_worker') THEN
+                CREATE POLICY reddit_comment_worker_policy ON public."RedditPostComment"
+                    TO medimate_reddit_worker
+                    FOR ALL
+                    USING (true)
+                    WITH CHECK (true);
+            END IF;
+        END
+        $comment_worker_policy$;
     END IF;
 END;
 $rls$;

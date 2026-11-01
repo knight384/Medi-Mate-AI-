@@ -41,6 +41,13 @@ export async function POST(request: Request) {
         await prisma.$transaction(async (tx) => {
             // Create a new user (strictly bounded fields to prevent privilege escalation)
             const user = await tx.user.create({
+                select: {
+                    id: true,
+                    username: true,
+                    hasOnboarded: true,
+                    createdAt: true,
+                    updatedAt: true,
+                },
                 data: {
                     username,
                     password: hashedPassword,

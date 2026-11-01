@@ -15,7 +15,10 @@ export async function onboardingSubmit(data: OnboardingSubmitRequest) {
     if (userId === undefined) throw new Error('User not found')
 
     return withTenantContext(userId, async (tx) => {
-        const user = await tx.user.findUniqueOrThrow({where: {id: userId}})
+        const user = await tx.user.findUniqueOrThrow({
+            where: {id: userId},
+            select: {id: true, createdAt: true, updatedAt: true}
+        })
         const personalInfo = await tx.healthData.findFirst({
             where: {authorId: userId, type: 'PERSONAL_INFO'}
         })
@@ -52,7 +55,11 @@ export async function onboardingSubmit(data: OnboardingSubmitRequest) {
         })
 
         // Update onboarding status
-        await tx.user.update({where: {id: userId}, data: {hasOnboarded: true}})
+        await tx.user.update({
+            where: {id: userId},
+            data: {hasOnboarded: true},
+            select: {id: true, hasOnboarded: true}
+        })
 
         // ChatRoom assistant modes 채팅 전부 생성
         const llmProvider = await tx.lLMProvider.findFirstOrThrow({where: {providerId: 'openai'}})

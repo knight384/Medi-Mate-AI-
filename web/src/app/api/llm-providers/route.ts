@@ -1,20 +1,17 @@
-import type {Prisma} from "@/lib/prisma";
 import {NextResponse} from "next/server";
 import {auth} from "@/auth";
-import {decrypt} from "@/lib/encryption";
 import {currentDeploymentEnv} from "@/lib/current-deployment-env";
 import {withTenantContext} from "@/lib/db-tenant";
 
-export interface LLMProvider extends Prisma.LLMProviderGetPayload<{
-    select: {
-        id: true,
-        providerId: true,
-        name: true,
-        apiKey: true,
-        apiURL: true,
-    }
-}> {
-    id: string
+export interface LLMProvider {
+    id: string;
+    providerId: string;
+    name: string;
+    hasApiKey: boolean;
+    apiKey: string; // Strictly masked; plaintext secret is NEVER exposed over the wire
+    apiURL: string;
+    order: number;
+    authorId?: string | null;
 }
 
 export interface LLMProviderListResponse {
@@ -43,17 +40,20 @@ export async function GET() {
                 return true;
             })
             .map((provider) => {
-                let decryptedApiKey: string
-                try {
-                    decryptedApiKey = decrypt(provider.apiKey)
-                } catch {
-                    decryptedApiKey = ''
-                }
+                const hasApiKey = Boolean(provider.apiKey && provider.apiKey.trim() !== '');
+                // Masked indicator: NEVER serialize decrypted secrets to the client
+                const apiKey = hasApiKey ? '••••••••' : '';
 
-                // Strictly ensure private API keys are never exposed if the provider is not user-owned
-                const apiKey = provider.authorId === userId ? decryptedApiKey : '';
-
-                return {...provider, apiKey}
+                return {
+                    id: provider.id,
+                    providerId: provider.providerId,
+                    name: provider.name,
+                    hasApiKey,
+                    apiKey,
+                    apiURL: provider.apiURL,
+                    order: provider.order,
+                    authorId: provider.authorId,
+                };
             })
     })
 }

@@ -6,11 +6,33 @@ import llmProviderSeed from "../../../../../prisma/data/llm-provider.json";
 import { readBoundedJson } from "@/lib/security/request-boundary";
 import { validateStructuralBounds } from "@/lib/security/structural-boundary";
 import { handleApiError, AppError } from "@/lib/errors";
+import { checkRateLimit, getClientIp } from "@/lib/security/rate-limiter";
 
 const MAX_REGISTER_PAYLOAD_BYTES = 64 * 1024; // 64 KB
 
 export async function POST(request: Request) {
     try {
+        const clientIp = getClientIp(request);
+        const rateLimit = await checkRateLimit(clientIp, {
+            prefix: 'reg',
+            maxRequests: 5,
+            windowSeconds: 60,
+        });
+
+        if (!rateLimit.allowed) {
+            return NextResponse.json(
+                { message: "Too many registration attempts. Please try again later." },
+                {
+                    status: 429,
+                    headers: {
+                        'Retry-After': String(rateLimit.resetSeconds),
+                        'X-RateLimit-Limit': String(rateLimit.limit),
+                        'X-RateLimit-Remaining': String(rateLimit.remaining),
+                        'X-RateLimit-Reset': String(rateLimit.resetSeconds),
+                    },
+                }
+            );
+        }
         const body = await readBoundedJson<{ username?: unknown; password?: unknown }>(request, {
             maxBytes: MAX_REGISTER_PAYLOAD_BYTES,
         });

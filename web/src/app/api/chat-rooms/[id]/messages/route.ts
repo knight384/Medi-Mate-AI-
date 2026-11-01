@@ -10,6 +10,8 @@ import { readBoundedJson } from "@/lib/security/request-boundary";
 import { validateStructuralBounds } from "@/lib/security/structural-boundary";
 import { handleApiError, AppError } from "@/lib/errors";
 import { withTenantContext } from "@/lib/db-tenant";
+import { buildClinicalSystemPrompt } from "@/lib/clinical/emergency-guidance";
+import { checkRateLimit } from "@/lib/security/rate-limiter";
 
 export interface ChatMessage extends Prisma.ChatMessageGetPayload<{
     select: {
@@ -69,6 +71,26 @@ export async function POST(
     if (!session || !user || !user.id) return NextResponse.json({error: 'Unauthorized'}, {status: 401})
     const userId = user.id;
 
+    const rateLimit = await checkRateLimit(userId, {
+        prefix: 'chat',
+        maxRequests: 20,
+        windowSeconds: 60,
+    });
+    if (!rateLimit.allowed) {
+        return NextResponse.json(
+            { error: 'Rate limit exceeded. Please wait a moment before sending more messages.' },
+            {
+                status: 429,
+                headers: {
+                    'Retry-After': String(rateLimit.resetSeconds),
+                    'X-RateLimit-Limit': String(rateLimit.limit),
+                    'X-RateLimit-Remaining': String(rateLimit.remaining),
+                    'X-RateLimit-Reset': String(rateLimit.resetSeconds),
+                },
+            }
+        );
+    }
+
     const {id} = await params
     let body: ChatMessageCreateRequest
     try {
@@ -121,21 +143,13 @@ export async function POST(
         // If decryption fails, continue with empty string
     }
 
-    const systemPrompt = `
-You are an AI medical assistant for the MediMate AI service.
-Respond following these guidelines:
-1. Provide helpful health-related information and advice.
-2. In case of an emergency, recommend visiting a hospital or calling emergency services immediately.
-3. Clearly state that your answer does not replace professional medical judgment.
-4. If you need more information to give an accurate answer, feel free to ask the user.
-5. Empathize with the user's symptoms and respond kindly.
+    const userRegion = req.headers.get('x-user-region') || undefined;
 
-### Assistant Personality and Guidelines:
-${assistantMode.systemPrompt}
-
-### User Information:
-${healthDataList.map((data) => JSON.stringify(data.data)).join('\n')}
-`
+    const systemPrompt = buildClinicalSystemPrompt({
+        regionCode: userRegion,
+        assistantPrompt: assistantMode.systemPrompt,
+        patientDataSummary: healthDataList.map((data) => JSON.stringify(data.data)).join('\n'),
+    });
 
     const selectedModel = chatRoom.llmProviderModelId ?? undefined;
     let chatModel: ChatOpenAI | ChatAnthropic | ChatGoogleGenerativeAI

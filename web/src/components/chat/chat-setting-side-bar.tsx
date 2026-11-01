@@ -159,19 +159,20 @@ export default function ChatSettingSideBar({chatRoomId}: ChatSettingSideBarProps
     }) => {
         if (!selectedLLMProvider) return;
 
-        const data = {
-            ...selectedLLMProvider,
-            apiKey: apiKey || selectedLLMProvider.apiKey,
-            apiURL: apiURL || selectedLLMProvider.apiURL
-        };
-        setSelectedLLMProvider(data);
-        await fetch(`/api/llm-providers/${selectedLLMProvider.id}`, {
+        const updatePayload: { apiURL?: string; apiKey?: string } = {};
+        if (apiURL !== undefined) updatePayload.apiURL = apiURL;
+        if (apiKey !== undefined && apiKey !== '••••••••') updatePayload.apiKey = apiKey;
+
+        const response = await fetch(`/api/llm-providers/${selectedLLMProvider.id}`, {
             method: 'PATCH',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify(data),
+            body: JSON.stringify(updatePayload),
         });
+        const resData = await response.json();
         await llmProvidersMutate();
-        setSelectedLLMProvider(data)
+        if (resData?.llmProvider) {
+            setSelectedLLMProvider(resData.llmProvider);
+        }
 
         // Patch ChatRoom with new LLMProvider
         await onChangeChatRoom({llmProviderId: selectedLLMProvider.id, llmProviderModelId: null});
@@ -229,8 +230,8 @@ export default function ChatSettingSideBar({chatRoomId}: ChatSettingSideBarProps
                             <div className="relative">
                                 <Input
                                     type={showApiKey ? "text" : "password"}
-                                    placeholder={t('enterApiKey')}
-                                    value={selectedLLMProvider?.apiKey || ''}
+                                    placeholder={selectedLLMProvider?.hasApiKey ? "•••••••• (Key Configured - enter to replace)" : t('enterApiKey')}
+                                    value={selectedLLMProvider?.apiKey === '••••••••' ? '' : (selectedLLMProvider?.apiKey || '')}
                                     onChange={(e) => onLLMProviderChange({apiKey: e.target.value})}
                                     className="pr-16"
                                 />

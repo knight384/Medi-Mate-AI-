@@ -14,6 +14,7 @@ import {
 } from '@/lib/storage';
 import { withTenantContext } from '@/lib/db-tenant';
 import { readBoundedMultipart } from '@/lib/storage/multipart-reader';
+import { checkRateLimit } from '@/lib/security/rate-limiter';
 
 export interface HealthData extends Prisma.HealthDataGetPayload<{
     select: {
@@ -53,6 +54,26 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
     const userId = session.user.id;
+
+    const rateLimit = await checkRateLimit(userId, {
+        prefix: 'upload',
+        maxRequests: 10,
+        windowSeconds: 60,
+    });
+    if (!rateLimit.allowed) {
+        return NextResponse.json(
+            { error: 'Rate limit exceeded. Please slow down your requests.' },
+            {
+                status: 429,
+                headers: {
+                    'Retry-After': String(rateLimit.resetSeconds),
+                    'X-RateLimit-Limit': String(rateLimit.limit),
+                    'X-RateLimit-Remaining': String(rateLimit.remaining),
+                    'X-RateLimit-Reset': String(rateLimit.resetSeconds),
+                },
+            }
+        );
+    }
 
     const contentType = req.headers.get('content-type');
     if (!contentType) {

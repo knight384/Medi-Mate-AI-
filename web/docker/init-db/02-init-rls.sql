@@ -139,12 +139,17 @@ BEGIN
             );
     END IF;
 
-    -- 6. LLMProvider (API credentials; system default has authorId IS NULL)
+    -- 6. LLMProvider (API credentials; system default has authorId IS NULL and apiKey = '')
+    -- Task E: Enforces that system default providers (authorId IS NULL) NEVER expose API credentials.
+    -- Non-empty API keys can strictly only be read if the provider belongs to the authenticated tenant.
     IF EXISTS (SELECT FROM pg_catalog.pg_tables WHERE schemaname = 'public' AND tablename = 'LLMProvider') THEN
         DROP POLICY IF EXISTS llm_provider_select_policy ON public."LLMProvider";
         CREATE POLICY llm_provider_select_policy ON public."LLMProvider"
             FOR SELECT
-            USING ("authorId" IS NULL OR "authorId" = pg_catalog.current_setting('app.current_user_id', true));
+            USING (
+                ("authorId" IS NOT NULL AND "authorId" = pg_catalog.current_setting('app.current_user_id', true))
+                OR ("authorId" IS NULL AND "apiKey" = '')
+            );
 
         DROP POLICY IF EXISTS llm_provider_modify_policy ON public."LLMProvider";
         CREATE POLICY llm_provider_modify_policy ON public."LLMProvider"
@@ -181,12 +186,19 @@ BEGIN
     END IF;
 
     -- 10. User (Account credentials and profiles)
-    -- Registration allows INSERT; profile access strictly restricted to self
+    -- Task C: Registration enforces safe defaults (hasOnboarded=false, bounded username/password lengths)
+    -- Profile access strictly restricted to self.
     IF EXISTS (SELECT FROM pg_catalog.pg_tables WHERE schemaname = 'public' AND tablename = 'User') THEN
         DROP POLICY IF EXISTS user_register_insert ON public."User";
         CREATE POLICY user_register_insert ON public."User"
             FOR INSERT
-            WITH CHECK (true);
+            WITH CHECK (
+                "hasOnboarded" = false
+                AND id IS NOT NULL
+                AND length(username) >= 1
+                AND length(username) <= 100
+                AND length(password) >= 20
+            );
 
         DROP POLICY IF EXISTS user_self_select ON public."User";
         CREATE POLICY user_self_select ON public."User"
@@ -206,12 +218,24 @@ BEGIN
     END IF;
 
     -- 11. RedditAccessToken (Restricted system tokens)
+    -- Task A: Spoofable Boolean GUC (app.is_admin_context) completely eliminated.
+    -- Table access explicitly targeted to dedicated service role TO medimate_reddit_worker.
+    -- Application runtime role (medimate_app) has zero access.
     IF EXISTS (SELECT FROM pg_catalog.pg_tables WHERE schemaname = 'public' AND tablename = 'RedditAccessToken') THEN
         DROP POLICY IF EXISTS reddit_token_tenant_isolation ON public."RedditAccessToken";
-        CREATE POLICY reddit_token_tenant_isolation ON public."RedditAccessToken"
-            FOR ALL
-            USING (pg_catalog.current_setting('app.is_admin_context', true) = 'true')
-            WITH CHECK (pg_catalog.current_setting('app.is_admin_context', true) = 'true');
+        DROP POLICY IF EXISTS reddit_token_worker_policy ON public."RedditAccessToken";
+
+        DO $worker_policy$
+        BEGIN
+            IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_reddit_worker') THEN
+                CREATE POLICY reddit_token_worker_policy ON public."RedditAccessToken"
+                    TO medimate_reddit_worker
+                    FOR ALL
+                    USING (true)
+                    WITH CHECK (true);
+            END IF;
+        END
+        $worker_policy$;
     END IF;
 END;
 $rls$;

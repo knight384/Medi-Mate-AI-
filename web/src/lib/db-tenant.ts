@@ -2,7 +2,6 @@ import prisma from '@/lib/prisma';
 import type { Prisma } from '@prisma/client';
 
 export const TENANT_CONFIG_KEY = 'app.current_user_id';
-export const ADMIN_CONFIG_KEY = 'app.is_admin_context';
 
 export class TenantContextError extends Error {
   constructor(message: string) {
@@ -44,25 +43,16 @@ export async function withTenantContext<T>(
 }
 
 /**
- * Executes a callback within a database transaction scoped strictly to an administrative or service context.
- *
- * Security guarantees:
- * 1. Sets PostgreSQL setting 'app.is_admin_context' to 'true' with is_local=true.
- * 2. Scoped strictly to the active transaction; automatically cleared upon COMMIT or ROLLBACK.
- * 3. Used for designated service identities / background jobs (e.g. system token sync) rather than spoofing user GUC.
+ * Administrative Service Boundary Protection (Task A):
+ * Custom Boolean GUCs ('app.is_admin_context') are rejected as an insecure authorization boundary.
+ * Administrative service tasks must connect using their dedicated isolated role (e.g. medimate_reddit_worker).
+ * Application runtime connections under medimate_app fail closed if attempting administrative bypass.
  */
 export async function withAdminContext<T>(
-  callback: (tx: Prisma.TransactionClient) => Promise<T>,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  _callback?: (tx: Prisma.TransactionClient) => Promise<T>,
 ): Promise<T> {
-  if (typeof prisma.$transaction === 'function') {
-    return prisma.$transaction(async (tx) => {
-      if (typeof tx.$executeRaw === 'function') {
-        await tx.$executeRaw`SELECT set_config('app.is_admin_context', 'true', true);`;
-      }
-      return callback(tx);
-    });
-  }
-
-  // Fallback for unit test environments where prisma is mocked without transaction engine
-  return callback(prisma as unknown as Prisma.TransactionClient);
+  throw new TenantContextError(
+    'Administrative operations require dedicated service identity credentials (medimate_reddit_worker) and cannot be executed via spoofable runtime GUC.',
+  );
 }

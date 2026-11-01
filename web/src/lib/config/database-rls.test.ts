@@ -6,7 +6,6 @@ import {
   withAdminContext,
   TenantContextError,
   TENANT_CONFIG_KEY,
-  ADMIN_CONFIG_KEY,
 } from '@/lib/db-tenant';
 import { findUserForAuth } from '@/lib/auth-user';
 import prisma from '@/lib/prisma';
@@ -78,22 +77,28 @@ describe('Database Multi-Tenant Isolation & RLS Infrastructure', () => {
     });
   });
 
-  describe('withAdminContext Helper', () => {
-    it('sets transaction-local app.is_admin_context with is_local=true', async () => {
-      const result = await withAdminContext(async (tx) => {
-        return tx.redditAccessToken.findMany();
-      });
-
-      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
-      expect(result).toEqual([]);
+  describe('Administrative Service Boundary (Task A: GUC Elimination)', () => {
+    it('rejects withAdminContext calls through application runtime with TenantContextError', async () => {
+      await expect(
+        withAdminContext(async (tx) => {
+          return tx.redditAccessToken.findMany();
+        }),
+      ).rejects.toThrow(
+        'Administrative operations require dedicated service identity credentials (medimate_reddit_worker)',
+      );
     });
 
-    it('verifies admin context key constant', () => {
-      expect(ADMIN_CONFIG_KEY).toBe('app.is_admin_context');
+    it('ensures application runtime does not spoof administrative GUC', async () => {
+      try {
+        await withAdminContext(async () => {});
+      } catch {
+        // Expected rejection
+      }
+      expect(prisma.$transaction).not.toHaveBeenCalled();
     });
   });
 
-  describe('findUserForAuth Pre-Authentication Lookup', () => {
+  describe('findUserForAuth Pre-Authentication Lookup (Task B)', () => {
     it('returns user credentials via security definer raw query when available', async () => {
       const user = await findUserForAuth('alice');
       expect(user).toEqual({ id: 'user_1', password: 'hashed_password' });
@@ -138,6 +143,20 @@ describe('Database Multi-Tenant Isolation & RLS Infrastructure', () => {
       expect(content).toContain("GRANT SELECT ON ALL TABLES IN SCHEMA public TO medimate_auth_definer");
     });
 
+    it('verifies 01-init-roles.sh creates dedicated worker role medimate_reddit_worker with NOBYPASSRLS (Task A)', async () => {
+      const content = await fsp.readFile(initRolesPath, 'utf-8');
+      expect(content).toContain("CREATE ROLE medimate_reddit_worker NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS");
+      expect(content).toContain("GRANT USAGE ON SCHEMA public TO medimate_reddit_worker");
+      expect(content).toContain('REVOKE ALL ON TABLE public."RedditAccessToken" FROM %I');
+      expect(content).toContain('GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public."RedditAccessToken" TO medimate_reddit_worker');
+    });
+
+    it('verifies 01-init-roles.sh restricts User table INSERT to specific registration columns (Task C)', async () => {
+      const content = await fsp.readFile(initRolesPath, 'utf-8');
+      expect(content).toContain('REVOKE INSERT ON TABLE public."User" FROM %I');
+      expect(content).toContain('GRANT INSERT (id, username, password, "hasOnboarded", "createdAt", "updatedAt") ON TABLE public."User" TO %I');
+    });
+
     it('verifies 01-init-roles.sh uses dynamic SQL format(%I, %L) to safely escape identifiers and literals', async () => {
       const content = await fsp.readFile(initRolesPath, 'utf-8');
       expect(content).toContain("EXECUTE format('CREATE ROLE %I WITH LOGIN PASSWORD %L NOSUPERUSER INHERIT'");
@@ -162,7 +181,7 @@ describe('Database Multi-Tenant Isolation & RLS Infrastructure', () => {
       expect(content).toContain("ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC");
     });
 
-    it('verifies 02-init-rls.sql defines security definer lookup_user_for_auth function with hardened search_path', async () => {
+    it('verifies 02-init-rls.sql defines security definer lookup_user_for_auth function with hardened search_path (Task B)', async () => {
       const content = await fsp.readFile(initRlsPath, 'utf-8');
       expect(content).toContain('CREATE OR REPLACE FUNCTION public.lookup_user_for_auth');
       expect(content).toContain('SECURITY DEFINER');
@@ -187,7 +206,7 @@ describe('Database Multi-Tenant Isolation & RLS Infrastructure', () => {
       expect(content).toContain("REVOKE EXECUTE ON FUNCTION public.trg_apply_rls_on_ddl() FROM PUBLIC");
     });
 
-    it('verifies 02-init-rls.sql uses physical column names for OAuth tables (user_id)', async () => {
+    it('verifies 02-init-rls.sql uses physical column names for OAuth tables (user_id) (Task D)', async () => {
       const content = await fsp.readFile(initRlsPath, 'utf-8');
       expect(content).toContain('CREATE POLICY oauth2_token_tenant_isolation ON public."OAuth2Token"');
       expect(content).toContain('USING ("user_id" = pg_catalog.current_setting(\'app.current_user_id\', true))');
@@ -197,13 +216,31 @@ describe('Database Multi-Tenant Isolation & RLS Infrastructure', () => {
       expect(content).toContain('USING ("user_id" = pg_catalog.current_setting(\'app.current_user_id\', true))');
     });
 
-    it('verifies 02-init-rls.sql User table policies allow registration INSERT while strictly isolating profiles', async () => {
+    it('verifies 02-init-rls.sql enforces safe defaults on user registration at row level (Task C)', async () => {
       const content = await fsp.readFile(initRlsPath, 'utf-8');
       expect(content).toContain('CREATE POLICY user_register_insert ON public."User"');
       expect(content).toContain('FOR INSERT');
-      expect(content).toContain('WITH CHECK (true)');
+      expect(content).toContain('"hasOnboarded" = false');
+      expect(content).toContain('id IS NOT NULL');
+      expect(content).toContain('length(username) >= 1');
+      expect(content).toContain('length(username) <= 100');
+      expect(content).toContain('length(password) >= 20');
       expect(content).toContain('CREATE POLICY user_self_select ON public."User"');
       expect(content).toContain('USING (id = pg_catalog.current_setting(\'app.current_user_id\', true))');
+    });
+
+    it('verifies 02-init-rls.sql enforces LLMProvider secret isolation for system records (Task E)', async () => {
+      const content = await fsp.readFile(initRlsPath, 'utf-8');
+      expect(content).toContain('CREATE POLICY llm_provider_select_policy ON public."LLMProvider"');
+      expect(content).toContain('("authorId" IS NOT NULL AND "authorId" = pg_catalog.current_setting(\'app.current_user_id\', true))');
+      expect(content).toContain('("authorId" IS NULL AND "apiKey" = \'\')');
+    });
+
+    it('verifies 02-init-rls.sql targets RedditAccessToken policy strictly TO medimate_reddit_worker (Task A)', async () => {
+      const content = await fsp.readFile(initRlsPath, 'utf-8');
+      expect(content).toContain('CREATE POLICY reddit_token_worker_policy ON public."RedditAccessToken"');
+      expect(content).toContain('TO medimate_reddit_worker');
+      expect(content).not.toContain("current_setting('app.is_admin_context'");
     });
 
     it('verifies 02-init-rls.sql ChatMessage policy isolates child messages via parent join', async () => {

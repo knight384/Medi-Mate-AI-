@@ -49,6 +49,14 @@ BEGIN
     ELSE
         ALTER ROLE medimate_auth_definer WITH NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE BYPASSRLS;
     END IF;
+
+    -- 2c. Create dedicated worker role for Reddit operations (least-privilege, no DDL, no superuser, no bypass RLS)
+    -- Isolated service identity to prevent spoofable Boolean GUC privilege escalation from runtime app role.
+    IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'medimate_reddit_worker') THEN
+        CREATE ROLE medimate_reddit_worker NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+    ELSE
+        ALTER ROLE medimate_reddit_worker WITH NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+    END IF;
 END
 $do$;
 
@@ -65,12 +73,29 @@ EXECUTE format('REVOKE CREATE ON SCHEMA public FROM %I', :'app_user');
 GRANT USAGE ON SCHEMA public TO medimate_auth_definer;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO medimate_auth_definer;
 
+-- Grant schema access to dedicated Reddit worker role
+GRANT USAGE ON SCHEMA public TO medimate_reddit_worker;
+
 -- 5. Grant data manipulation privileges on existing tables to runtime app role
 EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO %I', :'app_user');
+
+-- 5b. Enforce column-level least-privilege on User table for registration
+-- Prevents privilege escalation by restricting registration INSERT to required user columns only.
+IF EXISTS (SELECT FROM pg_catalog.pg_tables WHERE schemaname = 'public' AND tablename = 'User') THEN
+    EXECUTE format('REVOKE INSERT ON TABLE public."User" FROM %I', :'app_user');
+    EXECUTE format('GRANT INSERT (id, username, password, "hasOnboarded", "createdAt", "updatedAt") ON TABLE public."User" TO %I', :'app_user');
+END IF;
 
 -- Explicitly revoke access to migration history from application runtime
 IF EXISTS (SELECT FROM pg_catalog.pg_tables WHERE schemaname = 'public' AND tablename = '_prisma_migrations') THEN
     EXECUTE format('REVOKE ALL ON TABLE _prisma_migrations FROM %I', :'app_user');
+END IF;
+
+-- Explicitly revoke access to RedditAccessToken from application runtime role (Task A)
+-- Grants minimum required operations strictly to dedicated medimate_reddit_worker role
+IF EXISTS (SELECT FROM pg_catalog.pg_tables WHERE schemaname = 'public' AND tablename = 'RedditAccessToken') THEN
+    EXECUTE format('REVOKE ALL ON TABLE public."RedditAccessToken" FROM %I', :'app_user');
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public."RedditAccessToken" TO medimate_reddit_worker;
 END IF;
 
 -- 6. Grant sequence access on existing sequences to runtime app role

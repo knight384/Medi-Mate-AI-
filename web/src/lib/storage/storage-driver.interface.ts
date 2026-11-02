@@ -6,7 +6,7 @@ export interface StorageDriver {
   init(): Promise<void>;
   writeStream(
     storageKey: string,
-    sourceStream: Readable | NodeJS.ReadableStream | ReadableStream<Uint8Array>,
+    sourceStream: Readable | NodeJS.ReadableStream | ReadableStream<Uint8Array> | Buffer | Uint8Array,
     maxBytes?: number
   ): Promise<StoredObjectMetadata>;
   readStream(storageKey: string): Promise<StorageReadResult>;

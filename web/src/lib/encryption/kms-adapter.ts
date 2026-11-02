@@ -266,3 +266,67 @@ export async function decryptEnvelope(
     plaintextKey.fill(0);
   }
 }
+
+/**
+ * Re-wraps an EncryptedEnvelope under a new KMS key or active KEK version.
+ * This performs zero-downtime, O(1) key rotation without decrypting or re-encrypting the underlying data payload.
+ */
+export async function rewrapEnvelope(
+  envelope: EncryptedEnvelope,
+  kms: KMSClient,
+  targetKeyId: string,
+  newContext?: Record<string, string>
+): Promise<EncryptedEnvelope> {
+  // 1. Unwrap DEK using the historical or current key version
+  const { plaintextKey } = await kms.decryptDataKey(envelope.encryptedDataKey, envelope.context);
+
+  try {
+    const effectiveContext = newContext !== undefined ? newContext : envelope.context;
+    let newEncryptedKey: string;
+    let newKeyVersion: string;
+
+    if (kms instanceof LocalSyntheticKMSAdapter) {
+      const activeKek = (kms as unknown as { masterKeys: Map<string, Buffer>; activeVersion: string }).masterKeys.get(
+        (kms as unknown as { activeVersion: string }).activeVersion
+      );
+      if (!activeKek) {
+        throw new Error('Active master KEK not found for rewrap');
+      }
+      const kekNonce = crypto.randomBytes(12);
+      const cipher = crypto.createCipheriv('aes-256-gcm', activeKek, kekNonce);
+      if (effectiveContext) {
+        cipher.setAAD(Buffer.from(JSON.stringify(effectiveContext), 'utf8'));
+      }
+      const enc = Buffer.concat([cipher.update(plaintextKey), cipher.final()]);
+      const tag = cipher.getAuthTag();
+      const versionBuf = Buffer.from((kms as unknown as { activeVersion: string }).activeVersion, 'utf8');
+      const envelopeBuffer = Buffer.concat([
+        Buffer.from([versionBuf.length]),
+        versionBuf,
+        kekNonce,
+        tag,
+        enc,
+      ]);
+      newEncryptedKey = envelopeBuffer.toString('base64');
+      newKeyVersion = (kms as unknown as { activeVersion: string }).activeVersion;
+    } else {
+      const newKeyResult = await kms.generateDataKey(targetKeyId, effectiveContext);
+      newEncryptedKey = newKeyResult.encryptedKeyCiphertext;
+      newKeyVersion = newKeyResult.keyVersion;
+    }
+
+    return {
+      ...envelope,
+      keyId: targetKeyId,
+      keyVersion: newKeyVersion,
+      encryptedDataKey: newEncryptedKey,
+      context: effectiveContext,
+    };
+  } finally {
+    plaintextKey.fill(0);
+  }
+}
+
+export { AWSKMSClient } from './aws-kms-client';
+export type { AWSKMSConfig } from './aws-kms-client';
+

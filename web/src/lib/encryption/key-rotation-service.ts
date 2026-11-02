@@ -386,4 +386,27 @@ export class KeyRotationService {
       retiredKeys: Array.from(this.retiredKeysSet),
     };
   }
+
+  /**
+   * Generates a sanitized audit report for security compliance without exposing key material.
+   */
+  public generateAuditableReport() {
+    const totalInvocations = this.getInvocationCount(this.metrics.activeKeyId);
+    const rotationCheck = this.isRotationDue();
+    return {
+      activeKeyId: this.metrics.activeKeyId,
+      createdAt: new Date(this.metrics.createdAt).toISOString(),
+      ageDays: Math.floor((Date.now() - this.metrics.createdAt) / (24 * 60 * 60 * 1000)),
+      totalInvocations,
+      maxInvocationsThreshold: this.metrics.maxInvocationsThreshold,
+      hardLimitInvocations: this.metrics.hardLimitInvocations,
+      remainingUntilOperationalThreshold: Math.max(0, this.metrics.maxInvocationsThreshold - totalInvocations),
+      remainingUntilNistHardLimit: Math.max(0, this.metrics.hardLimitInvocations - totalInvocations),
+      retiredKeysCount: this.retiredKeysSet.size,
+      retiredKeys: Array.from(this.retiredKeysSet),
+      distributedAccountingEnforced: this.requireDistributedAccounting,
+      isRotationRequired: rotationCheck.due,
+      rotationReason: rotationCheck.reason,
+    };
+  }
 }

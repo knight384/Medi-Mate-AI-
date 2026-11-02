@@ -12,6 +12,15 @@ import { getEncryptionKey } from '@/lib/encryption';
 
 import { StorageDriver } from './storage-driver.interface';
 import { ProtectedScratchStorage, protectedScratchStorage } from './temp-storage';
+import {
+  MAGIC_HEADER_V4,
+  KMSProviderType,
+  parseEnvelopeHeaderV4,
+  serializeEnvelopeHeaderV4,
+  computeEnvelopeAAD,
+  getAuthTagOffsetV4,
+} from '@/lib/encryption/envelope-format';
+import { KMSClient, LocalSyntheticKMSAdapter } from '@/lib/encryption/kms-adapter';
 
 export interface StoredObjectMetadata {
   storageKey: string;
@@ -81,12 +90,14 @@ export interface LocalStorageDriverOptions {
   keyring?: Map<string, Buffer>;
   activeKeyId?: string;
   scratchStorage?: ProtectedScratchStorage;
+  kmsClient?: KMSClient;
 }
 
 export interface WriteStreamOptions {
-  version?: 'MM_ENC02' | 'MM_ENC03';
+  version?: 'MM_ENC02' | 'MM_ENC03' | 'MM_ENC04';
   keyId?: string;
   bindVersionAndKeyIdInAAD?: boolean;
+  kmsProviderType?: KMSProviderType;
 }
 
 export class LocalStorageDriver implements StorageDriver {
@@ -95,6 +106,7 @@ export class LocalStorageDriver implements StorageDriver {
   private readonly keyring: Map<string, Buffer>;
   private readonly activeKeyId: string;
   private readonly scratchStorage: ProtectedScratchStorage;
+  private readonly kmsClient?: KMSClient;
 
   constructor(
     optionsOrDir?: string | LocalStorageDriverOptions,
@@ -103,6 +115,7 @@ export class LocalStorageDriver implements StorageDriver {
   ) {
     let customStorageDir: string | undefined;
     let customScratch: ProtectedScratchStorage | undefined;
+    let kmsClient: KMSClient | undefined;
 
     if (typeof optionsOrDir === 'string') {
       customStorageDir = optionsOrDir;
@@ -113,10 +126,13 @@ export class LocalStorageDriver implements StorageDriver {
       this.keyring = optionsOrDir.keyring ? new Map(optionsOrDir.keyring) : new Map();
       this.activeKeyId = optionsOrDir.activeKeyId || DEFAULT_KEY_ID;
       customScratch = optionsOrDir.scratchStorage;
+      kmsClient = optionsOrDir.kmsClient;
     } else {
       this.keyring = new Map();
       this.activeKeyId = DEFAULT_KEY_ID;
     }
+
+    this.kmsClient = kmsClient;
 
     validateKeyId(this.activeKeyId);
 
@@ -231,6 +247,15 @@ export class LocalStorageDriver implements StorageDriver {
   }
 
   /**
+   * Restores an encrypted document object from a backup archive without double-encryption.
+   */
+  public async restoreRawEncryptedObject(storageKey: string, encryptedBytes: Buffer): Promise<void> {
+    const targetPath = this.resolveSecurePath(storageKey);
+    await fsp.mkdir(path.dirname(targetPath), { recursive: true, mode: 0o700 });
+    await fsp.writeFile(targetPath, encryptedBytes, { mode: 0o600 });
+  }
+
+  /**
    * Scrubs orphaned temporary files (> maxAgeMs old) resulting from process crashes or ungraceful terminations.
    * Active temporary files (< maxAgeMs) are untouched, avoiding race conditions with concurrent workers.
    *
@@ -298,7 +323,7 @@ export class LocalStorageDriver implements StorageDriver {
    */
   public async writeStream(
     storageKey: string,
-    sourceStream: Readable | NodeJS.ReadableStream | ReadableStream<Uint8Array>,
+    sourceStream: Readable | NodeJS.ReadableStream | ReadableStream<Uint8Array> | Buffer | Uint8Array,
     maxBytes?: number,
     options?: WriteStreamOptions
   ): Promise<StoredObjectMetadata> {
@@ -322,20 +347,38 @@ export class LocalStorageDriver implements StorageDriver {
     const tempFilePath = path.join(this.tempDir, tempFileName);
 
     const version = options?.version || 'MM_ENC03';
-    const keyId = (options?.keyId || this.activeKeyId).padEnd(4, ' ').slice(0, 4);
-    const key = this.getKey(keyId);
-
-    // Cryptographic initialization (NIST SP 800-38D: 12-byte nonce)
-    const nonce = crypto.randomBytes(12);
-    const cipher = crypto.createCipheriv('aes-256-gcm', key, nonce);
-    // Bind storage key as AAD to prevent document swapping/relocation attacks
-    cipher.setAAD(Buffer.from(storageKey, 'utf8'));
-
-    // Construct header placeholder
+    let key: Buffer;
     let headerPlaceholder: Buffer;
     let tagOffset: number;
+    let cipher: crypto.CipherGCM;
+    let plaintextDekToWipe: Buffer | undefined;
 
-    if (version === 'MM_ENC02') {
+    if (version === 'MM_ENC04') {
+      const kms = this.kmsClient || new LocalSyntheticKMSAdapter();
+      const rawKeyId = options?.keyId || this.activeKeyId;
+      const { plaintextKey, encryptedKeyCiphertext } = await kms.generateDataKey(rawKeyId, { storageKey });
+      key = plaintextKey;
+      plaintextDekToWipe = plaintextKey;
+
+      const providerType =
+        options?.kmsProviderType ||
+        (kms.providerName === 'AWS_KMS' ? KMSProviderType.AWS_KMS : KMSProviderType.LOCAL_SYNTHETIC);
+      const wrappedDek = Buffer.from(encryptedKeyCiphertext, 'base64');
+      const nonce = crypto.randomBytes(12);
+
+      cipher = crypto.createCipheriv('aes-256-gcm', key, nonce);
+      const aad = computeEnvelopeAAD(storageKey, providerType, rawKeyId);
+      cipher.setAAD(aad);
+
+      headerPlaceholder = serializeEnvelopeHeaderV4(providerType, rawKeyId, wrappedDek, nonce, Buffer.alloc(16));
+      tagOffset = getAuthTagOffsetV4(Buffer.from(rawKeyId, 'utf8').length, wrappedDek.length);
+    } else if (version === 'MM_ENC02') {
+      const keyId = (options?.keyId || this.activeKeyId).padEnd(4, ' ').slice(0, 4);
+      key = this.getKey(keyId);
+      const nonce = crypto.randomBytes(12);
+      cipher = crypto.createCipheriv('aes-256-gcm', key, nonce);
+      cipher.setAAD(Buffer.from(storageKey, 'utf8'));
+
       // Legacy V2 container: 8 bytes magic + 12 bytes nonce + 16 bytes tag placeholder
       headerPlaceholder = Buffer.concat([
         MAGIC_HEADER_V2,
@@ -344,6 +387,12 @@ export class LocalStorageDriver implements StorageDriver {
       ]);
       tagOffset = 20;
     } else {
+      const keyId = (options?.keyId || this.activeKeyId).padEnd(4, ' ').slice(0, 4);
+      key = this.getKey(keyId);
+      const nonce = crypto.randomBytes(12);
+      cipher = crypto.createCipheriv('aes-256-gcm', key, nonce);
+      cipher.setAAD(Buffer.from(storageKey, 'utf8'));
+
       // Modern V3 container: 8 bytes magic + 4 bytes keyId + 12 bytes nonce + 16 bytes tag placeholder
       const keyIdBuf = Buffer.alloc(4);
       keyIdBuf.write(keyId, 0, 4, 'ascii');
@@ -363,7 +412,9 @@ export class LocalStorageDriver implements StorageDriver {
 
     // Convert Web ReadableStream to Node Readable if needed
     let nodeReadable: Readable;
-    if (sourceStream instanceof Readable) {
+    if (Buffer.isBuffer(sourceStream) || sourceStream instanceof Uint8Array) {
+      nodeReadable = Readable.from([Buffer.from(sourceStream)]);
+    } else if (sourceStream instanceof Readable) {
       nodeReadable = sourceStream;
     } else if (typeof (sourceStream as ReadableStream<Uint8Array>).getReader === 'function') {
       nodeReadable = Readable.fromWeb(sourceStream as import('node:stream/web').ReadableStream);
@@ -451,6 +502,8 @@ export class LocalStorageDriver implements StorageDriver {
         // Ignore deletion error if temp file wasn't created
       }
       throw error;
+    } finally {
+      plaintextDekToWipe?.fill(0);
     }
   }
 
@@ -502,33 +555,58 @@ export class LocalStorageDriver implements StorageDriver {
       );
     }
 
-    const maxHeaderBuf = Buffer.alloc(HEADER_SIZE_V3);
+    const maxHeaderBuf = Buffer.alloc(4096);
     const fh = await fsp.open(realPath, 'r');
     let bytesRead = 0;
     try {
-      const res = await fh.read(maxHeaderBuf, 0, HEADER_SIZE_V3, 0);
+      const res = await fh.read(maxHeaderBuf, 0, 4096, 0);
       bytesRead = res.bytesRead;
     } finally {
       await fh.close();
     }
 
-    let keyId = DEFAULT_KEY_ID;
+    let key: Buffer;
     let nonce: Buffer;
     let authTag: Buffer;
+    let aad: Buffer;
     let cipherStartOffset: number;
+    let plaintextDekToWipe: Buffer | undefined;
 
-    if (bytesRead >= HEADER_SIZE_V3 && maxHeaderBuf.subarray(0, 8).equals(MAGIC_HEADER_V3)) {
+    if (bytesRead >= 8 && maxHeaderBuf.subarray(0, 8).equals(MAGIC_HEADER_V4)) {
+      // Enterprise envelope encryption MM_ENC04 container
+      const v4Header = parseEnvelopeHeaderV4(maxHeaderBuf.subarray(0, bytesRead));
+      cipherStartOffset = v4Header.headerLength;
+      nonce = v4Header.nonce;
+      authTag = v4Header.authTag;
+      aad = computeEnvelopeAAD(storageKey, v4Header.providerType, v4Header.keyId);
+
+      const kms = this.kmsClient || new LocalSyntheticKMSAdapter();
+      let plaintextKey: Buffer;
+      try {
+        const res = await kms.decryptDataKey(v4Header.wrappedDek.toString('base64'), { storageKey });
+        plaintextKey = res.plaintextKey;
+      } catch (err) {
+        throw new StorageSecurityError(
+          `Cryptographic authentication failed: KMS DEK unwrap rejected or context tampered (${(err as Error).message})`
+        );
+      }
+      key = plaintextKey;
+      plaintextDekToWipe = plaintextKey;
+    } else if (bytesRead >= HEADER_SIZE_V3 && maxHeaderBuf.subarray(0, 8).equals(MAGIC_HEADER_V3)) {
       // Modern MM_ENC03 container
-      keyId = maxHeaderBuf.subarray(8, 12).toString('ascii').trim();
+      const keyId = maxHeaderBuf.subarray(8, 12).toString('ascii').trim();
       nonce = maxHeaderBuf.subarray(12, 24);
       authTag = maxHeaderBuf.subarray(24, 40);
       cipherStartOffset = HEADER_SIZE_V3;
+      aad = Buffer.from(storageKey, 'utf8');
+      key = this.getKey(keyId);
     } else if (bytesRead >= HEADER_SIZE_V2 && maxHeaderBuf.subarray(0, 8).equals(MAGIC_HEADER_V2)) {
       // Backward-compatible MM_ENC02 container
-      keyId = DEFAULT_KEY_ID;
       nonce = maxHeaderBuf.subarray(8, 20);
       authTag = maxHeaderBuf.subarray(20, 36);
       cipherStartOffset = HEADER_SIZE_V2;
+      aad = Buffer.from(storageKey, 'utf8');
+      key = this.getKey(DEFAULT_KEY_ID);
     } else {
       // Rejection of unauthenticated / headerless legacy files in production
       throw new StorageSecurityError(
@@ -536,7 +614,6 @@ export class LocalStorageDriver implements StorageDriver {
       );
     }
 
-    const key = this.getKey(keyId);
     await this.init();
 
     // Quarantine Decryption: decrypt into private isolated scratch storage
@@ -544,7 +621,7 @@ export class LocalStorageDriver implements StorageDriver {
       await this.scratchStorage.allocateFile('quarantine', '.quarantine.tmp', 'stream_verification');
 
     const decipher = crypto.createDecipheriv('aes-256-gcm', key, nonce);
-    decipher.setAAD(Buffer.from(storageKey, 'utf8'));
+    decipher.setAAD(aad);
     decipher.setAuthTag(authTag);
 
     const cipherStream = fs.createReadStream(realPath, { start: cipherStartOffset });
@@ -561,6 +638,8 @@ export class LocalStorageDriver implements StorageDriver {
       throw new StorageSecurityError(
         `Cryptographic authentication failed: document ciphertext on disk has been tampered with or corrupted (${(pipelineErr as Error).message})`
       );
+    } finally {
+      plaintextDekToWipe?.fill(0);
     }
 
     // Authentication succeeded! Stat the verified quarantine file for exact size

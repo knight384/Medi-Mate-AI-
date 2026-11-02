@@ -1,6 +1,8 @@
 import { getEncryptionKey, EncryptionError } from './index';
 import { AppError } from '@/lib/errors';
 import { logger } from '@/lib/logger';
+import { AWSKMSClient, AWSKMSConfig } from './aws-kms-client';
+import { KMSClient } from './kms-adapter';
 
 export interface KeyProvider {
   readonly providerType: 'local' | 'cloud_kms';
@@ -84,19 +86,37 @@ export class LocalKeyProvider implements KeyProvider {
 /**
  * Cloud KMS Key Provider (AWS KMS / GCP Cloud KMS)
  *
- * Implements cloud-managed master keys.
+ * Implements cloud-managed master keys backed by AWS KMS client.
  * Unconfigured by default in local/on-prem sandbox; operations are fail-safe.
  */
 export class CloudKMSKeyProvider implements KeyProvider {
   public readonly providerType = 'cloud_kms' as const;
+  private readonly kmsClient: AWSKMSClient;
   private readonly kmsKeyArn?: string;
   private readonly region?: string;
-  private readonly isConfigured: boolean;
+  private readonly isConfiguredState: boolean;
 
-  constructor(options?: { kmsKeyArn?: string; region?: string }) {
-    this.kmsKeyArn = options?.kmsKeyArn || process.env.AWS_KMS_KEY_ARN || process.env.GCP_KMS_KEY_NAME;
+  constructor(options?: AWSKMSConfig & { kmsKeyArn?: string }) {
+    this.kmsKeyArn = options?.kmsKeyArn || options?.keyArn || process.env.AWS_KMS_KEY_ARN || process.env.MEDIMATE_CLOUD_KMS_KEY_ARN;
     this.region = options?.region || process.env.AWS_REGION;
-    this.isConfigured = Boolean(this.kmsKeyArn);
+    this.kmsClient = new AWSKMSClient({
+      keyArn: this.kmsKeyArn,
+      region: this.region,
+      accessKeyId: options?.accessKeyId,
+      secretAccessKey: options?.secretAccessKey,
+      sessionToken: options?.sessionToken,
+      endpoint: options?.endpoint,
+      fetchFn: options?.fetchFn,
+    });
+    this.isConfiguredState = this.kmsClient.isConfigured();
+  }
+
+  public isConfigured(): boolean {
+    return this.isConfiguredState;
+  }
+
+  public getKmsClient(): KMSClient {
+    return this.kmsClient;
   }
 
   public getActiveKeyId(): string {
@@ -109,7 +129,7 @@ export class CloudKMSKeyProvider implements KeyProvider {
 
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   public async getKey(_keyId?: string): Promise<Buffer> {
-    if (!this.isConfigured) {
+    if (!this.isConfiguredState) {
       throw new CloudKMSBlockedError();
     }
     // Direct plaintext key extraction from Cloud KMS is forbidden by cloud HSM design;

@@ -36,6 +36,11 @@ const envSchema = z.object({
   MEDIMATE_CLOUD_STORAGE_BUCKET: z.string().optional(),
   MEDIMATE_CLOUD_STORAGE_REGION: z.string().optional(),
   MEDIMATE_CLOUD_KMS_KEY_ARN: z.string().optional(),
+  AWS_ACCESS_KEY_ID: z.string().optional(),
+  AWS_SECRET_ACCESS_KEY: z.string().optional(),
+  AWS_REGION: z.string().optional(),
+  AWS_KMS_KEY_ARN: z.string().optional(),
+  AWS_KMS_ENDPOINT: z.string().optional(),
 });
 
 export type DeploymentEnv = z.infer<typeof deploymentEnvSchema>;
@@ -125,4 +130,36 @@ export function validateDeploymentProfileConfig(env: AppEnv = getEnv()): {
   }
 
   return { valid: true, mode, warnings };
+}
+
+/**
+ * Validates production secret hygiene.
+ * Prohibits placeholder secrets, empty keys, and missing credentials in production.
+ */
+export function validateProductionSecrets(env: AppEnv = getEnv()): void {
+  if (env.NODE_ENV !== 'production') return;
+
+  const mode = env.MEDIMATE_DEPLOYMENT_MODE ?? env.DEPLOYMENT_ENV ?? env.NEXT_PUBLIC_DEPLOYMENT_ENV;
+  const isPlaceholder = (val?: string) =>
+    !val || val.includes('REPLACE_WITH_') || val.includes('mysecretpassword');
+
+  if (isPlaceholder(env.AUTH_SECRET) || (env.AUTH_SECRET && env.AUTH_SECRET.length < 32)) {
+    throw new Error(
+      'Insecure production configuration: AUTH_SECRET must be a cryptographically strong secret with at least 32 characters.'
+    );
+  }
+
+  if (mode === 'local' || mode === 'hybrid') {
+    if (isPlaceholder(env.ENCRYPTION_KEY)) {
+      throw new Error(
+        'Insecure production configuration: ENCRYPTION_KEY must be a valid 32-byte base64-encoded secret.'
+      );
+    }
+  }
+
+  if (mode === 'cloud') {
+    if (!env.DATABASE_URL || isPlaceholder(env.DATABASE_URL)) {
+      throw new Error('Production cloud mode requires a valid DATABASE_URL without placeholder credentials.');
+    }
+  }
 }

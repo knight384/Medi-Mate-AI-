@@ -75,17 +75,17 @@ export function isValidStorageKey(storageKey: string): boolean {
   if (storageKey.includes('..') || storageKey.includes('\\') || storageKey.startsWith('/')) {
     return false;
   }
-  // Must match users/<userId>/<fileId>.<ext>
-  return /^users\/[a-zA-Z0-9_-]+\/[a-zA-Z0-9_-]+\.[a-zA-Z0-9]+$/.test(storageKey);
+  // Must match users/<userId>/<fileId>.<ext> or tenants/<tenantId>/<fileId>.<ext>
+  return /^(?:users|tenants)\/[a-zA-Z0-9_-]+\/[a-zA-Z0-9_-]+\.[a-zA-Z0-9]+$/.test(storageKey);
 }
 
 /**
- * Extracts the user namespace (userId) from a valid internal storage key.
+ * Extracts the user or tenant namespace (userId/tenantId) from a valid internal storage key.
  * Returns null if the storage key format is invalid.
  */
 export function extractStorageKeyOwner(storageKey: string): string | null {
   if (!isValidStorageKey(storageKey)) return null;
-  const match = /^users\/([a-zA-Z0-9_-]+)\/[a-zA-Z0-9_-]+\.[a-zA-Z0-9]+$/.exec(storageKey);
+  const match = /^(?:users|tenants)\/([a-zA-Z0-9_-]+)\/[a-zA-Z0-9_-]+\.[a-zA-Z0-9]+$/.exec(storageKey);
   return match ? match[1] : null;
 }
 

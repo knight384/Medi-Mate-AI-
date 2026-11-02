@@ -7,6 +7,7 @@ import {
 } from './types';
 import { ConsentAndPrivacyPolicy, PrivacyConsentError } from './consent-policy';
 import { ProviderHealthCheck } from './health-check';
+import { serverSidePolicyEnforcement } from './policy-enforcement';
 import { deploymentProfileManager } from '@/lib/deployment';
 import { AppError } from '@/lib/errors';
 import { logger } from '@/lib/logger';
@@ -129,6 +130,9 @@ export class AIProviderRouter {
             ? 'google'
             : this.defaultCloudProviderId;
 
+        // Authoritative server-side policy and data egress verification
+        serverSidePolicyEnforcement.enforceEgressPolicy(context, cloudProviderId, context.taskType);
+
         const cloudHealth = await this.healthCheck.getHealth(cloudProviderId);
         if (!cloudHealth.isAvailable) {
           throw new InferenceUnavailableError(
@@ -176,19 +180,24 @@ export class AIProviderRouter {
 
     // If cloud is consented and available, use cloud
     if (consentEval.permitted && cloudHealth.isAvailable) {
-      const audit = ConsentAndPrivacyPolicy.createAuditRecord(
-        context,
-        cloudProviderId,
-        'CLOUD',
-        'Non-sensitive task routed to cloud AI per policy and available capacity.'
-      );
-      return {
-        selectedProviderId: cloudProviderId,
-        executionLocation: 'CLOUD',
-        reason: audit.decisionReason,
-        auditRecord: audit,
-        privacyGatePassed: true,
-      };
+      try {
+        serverSidePolicyEnforcement.enforceEgressPolicy(context, cloudProviderId, context.taskType);
+        const audit = ConsentAndPrivacyPolicy.createAuditRecord(
+          context,
+          cloudProviderId,
+          'CLOUD',
+          'Non-sensitive task routed to cloud AI per policy and available capacity.'
+        );
+        return {
+          selectedProviderId: cloudProviderId,
+          executionLocation: 'CLOUD',
+          reason: audit.decisionReason,
+          auditRecord: audit,
+          privacyGatePassed: true,
+        };
+      } catch {
+        // If server policy blocks cloud egress for this task, fall through to local
+      }
     }
 
     // Fall back to local inference if available
@@ -229,7 +238,15 @@ export class AIProviderRouter {
       );
     }
 
-    const response = await provider.invoke(request);
+    let response: InferenceResponse;
+    try {
+      response = await provider.invoke(request);
+    } catch (err) {
+      logger.error('AI provider invocation failed', {
+        providerId: decision.selectedProviderId,
+      });
+      throw serverSidePolicyEnforcement.sanitizeProviderError(err, decision.selectedProviderId);
+    }
 
     return {
       ...response,

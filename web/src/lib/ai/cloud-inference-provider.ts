@@ -12,6 +12,7 @@ export interface CloudInferenceConfig {
   apiKey?: string;
   model?: string;
   simulatedResponse?: string;
+  simulatedError?: string;
 }
 
 export class CloudInferenceBlockedError extends AppError {
@@ -33,12 +34,14 @@ export class CloudInferenceProvider implements AIInferenceProvider {
   private readonly apiKey?: string;
   private readonly defaultModel: string;
   private readonly simulatedResponse?: string;
+  private readonly simulatedError?: string;
 
   constructor(config: CloudInferenceConfig) {
     this.providerId = config.providerId;
     this.apiKey = config.apiKey || this.resolveApiKey(config.providerId);
     this.defaultModel = config.model || this.resolveDefaultModel(config.providerId);
     this.simulatedResponse = config.simulatedResponse;
+    this.simulatedError = config.simulatedError;
   }
 
   private resolveApiKey(provider: string): string | undefined {
@@ -56,7 +59,7 @@ export class CloudInferenceProvider implements AIInferenceProvider {
   }
 
   public isConfigured(): boolean {
-    if (this.simulatedResponse !== undefined) return true;
+    if (this.simulatedResponse !== undefined || this.simulatedError !== undefined) return true;
     return Boolean(this.apiKey && this.apiKey.trim() !== '');
   }
 
@@ -90,6 +93,10 @@ export class CloudInferenceProvider implements AIInferenceProvider {
       throw new CloudInferenceBlockedError(
         `[BLOCKED] Cloud inference provider "${this.providerId}" cannot execute: API key is not configured.`
       );
+    }
+
+    if (this.simulatedError) {
+      throw new Error(this.simulatedError);
     }
 
     // Simulated response for tests or staging validation

@@ -255,7 +255,7 @@ export class LocalStorageDriver implements StorageDriver {
           const fullPath = path.join(this.tempDir, entry.name);
           try {
             const stat = await fsp.stat(fullPath);
-            if (now - stat.mtimeMs > maxAgeMs) {
+            if (now - stat.mtimeMs >= maxAgeMs) {
               await fsp.unlink(fullPath);
               cleanedCount++;
               logger.info('Cleaned up orphaned temporary storage file', {

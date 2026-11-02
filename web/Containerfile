@@ -1,21 +1,31 @@
 FROM node:24.22.2-alpine
 LABEL authors="OpenHealth"
 
-RUN apk add -U graphicsmagick
+RUN apk add -U --no-cache graphicsmagick curl wget
 
 WORKDIR /app
 
-COPY package.json prisma/ .
+# Copy package manifests and scripts first for optimal layer caching
+COPY package*.json ./
+COPY prisma ./prisma/
+COPY scripts ./scripts/
 
 RUN npm install
 
+# Copy full application source code
 COPY . .
 
+# Build Next.js bundle and configure least-privilege runtime user
+ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build && \
-    adduser --disabled-password ohuser && \
-    mkdir -p /app/storage && \
-    chown -R ohuser /app
+    adduser -D ohuser && \
+    mkdir -p /app/storage /app/scratch && \
+    chown -R ohuser:ohuser /app/storage /app/scratch /app/.next
 
 USER ohuser
 EXPOSE 3000
-ENTRYPOINT ["sh", "-c", "if [ \"$DEPLOYMENT_ENV\" = \"local\" ]; then npm run db:migrate:deploy && npx prisma db seed; elif [ \"$RUN_MIGRATIONS\" = \"true\" ]; then npm run db:migrate:deploy; fi && exec npm start"]
+
+HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
+  CMD wget -qO- http://127.0.0.1:3000/api/health || exit 1
+
+ENTRYPOINT ["sh", "-c", "if [ \"$RUN_MIGRATIONS\" = \"true\" ]; then npm run db:migrate:deploy; fi && exec npm start"]

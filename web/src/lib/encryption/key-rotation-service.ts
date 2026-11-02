@@ -1,6 +1,9 @@
 import { LocalKeyProvider } from './key-providers';
 import { logger } from '@/lib/logger';
 import crypto from 'node:crypto';
+import fsp from 'node:fs/promises';
+import fs from 'node:fs';
+import path from 'node:path';
 import { redisConnectionManager } from '@/lib/redis/connection-manager';
 
 export class RetiredKeyEncryptionError extends Error {
@@ -21,6 +24,14 @@ export class NistIvLimitExceededError extends Error {
   }
 }
 
+export class DistributedAccountingUnavailableError extends Error {
+  public readonly code = 'DISTRIBUTED_ACCOUNTING_UNAVAILABLE';
+  constructor(message = 'Encryption write blocked: Reliable distributed GCM invocation accounting is unavailable.') {
+    super(message);
+    this.name = 'DistributedAccountingUnavailableError';
+  }
+}
+
 export interface KeyLifecycleMetrics {
   activeKeyId: string;
   createdAt: number;
@@ -36,19 +47,28 @@ export interface KeyRotationOptions {
   hardLimitInvocations?: number;
   maxAgeMs?: number;
   createdAt?: number;
+  requireDistributedAccounting?: boolean;
+  persistenceFilePath?: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  redisClient?: any;
 }
 
 /**
  * Key Rotation & Lifecycle Service
  *
  * Implements global GCM invocation tracking and rotation bounds aligned with NIST SP 800-38D Section 8.3.
- * Supports cross-instance counter aggregation via Redis with atomic in-memory fallback.
+ * Supports cross-instance counter aggregation via Redis and local ledger persistence across restarts.
+ * Fails closed on encryption writes when reliable distributed accounting cannot be guaranteed.
  */
 export class KeyRotationService {
   private readonly metrics: KeyLifecycleMetrics;
   private readonly keyProvider: LocalKeyProvider;
   private readonly retiredKeysSet = new Set<string>();
   private readonly memoryCounters = new Map<string, number>();
+  private readonly requireDistributedAccounting: boolean;
+  private readonly persistenceFilePath?: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private injectedRedisClient?: any;
 
   constructor(keyProvider: LocalKeyProvider, options?: KeyRotationOptions) {
     this.keyProvider = keyProvider;
@@ -64,18 +84,115 @@ export class KeyRotationService {
       retiredKeys: [],
     };
 
+    this.requireDistributedAccounting = Boolean(options?.requireDistributedAccounting);
+    this.persistenceFilePath = options?.persistenceFilePath;
+    this.injectedRedisClient = options?.redisClient;
+
     this.memoryCounters.set(activeKeyId, 0);
+
+    // If local persistence file exists, synchronously attempt load
+    if (this.persistenceFilePath && fs.existsSync(this.persistenceFilePath)) {
+      try {
+        const raw = fs.readFileSync(this.persistenceFilePath, 'utf8');
+        const parsed = JSON.parse(raw);
+        if (parsed.counters && typeof parsed.counters === 'object') {
+          for (const [k, v] of Object.entries(parsed.counters)) {
+            if (typeof v === 'number') {
+              this.memoryCounters.set(k, v);
+            }
+          }
+        }
+        if (typeof parsed.activeKeyId === 'string' && parsed.activeKeyId === activeKeyId) {
+          this.metrics.totalInvocations = this.memoryCounters.get(activeKeyId) || 0;
+        }
+      } catch (err) {
+        logger.warn('Failed reading local key lifecycle ledger file', {
+          path: this.persistenceFilePath,
+          error: String(err),
+        });
+      }
+    }
+  }
+
+  /**
+   * For tests or runtime configuration
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  public setRedisClient(client: any): void {
+    this.injectedRedisClient = client;
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private getRedisClient(): any | undefined {
+    if (this.injectedRedisClient) return this.injectedRedisClient;
+    try {
+      const conn = redisConnectionManager;
+      if (conn.getConnectionState().connected) {
+        return conn.getClient();
+      }
+    } catch {
+      // Redis manager unavailable
+    }
+    return undefined;
+  }
+
+  /**
+   * Recovers/synchronizes invocation counters from Redis or durable storage.
+   * Call on instance startup to ensure counts survive restarts.
+   */
+  public async syncFromStore(keyId?: string): Promise<number> {
+    const id = keyId || this.metrics.activeKeyId;
+    const client = this.getRedisClient();
+
+    if (client) {
+      try {
+        const redisKey = `medimate:gcm:invocations:${id}`;
+        const val = await client.get(redisKey);
+        if (val !== null && val !== undefined) {
+          const num = parseInt(String(val), 10);
+          if (!isNaN(num)) {
+            this.memoryCounters.set(id, Math.max(num, this.memoryCounters.get(id) || 0));
+            if (id === this.metrics.activeKeyId) {
+              this.metrics.totalInvocations = this.memoryCounters.get(id) || 0;
+            }
+            return this.memoryCounters.get(id)!;
+          }
+        }
+      } catch (err) {
+        logger.warn('Failed syncing key invocations from Redis', {
+          keyId: id,
+          error: String(err),
+        });
+        if (this.requireDistributedAccounting) {
+          throw new DistributedAccountingUnavailableError(
+            `Unable to sync GCM invocation count from Redis for key ${id}: ${String(err)}`
+          );
+        }
+      }
+    }
+
+    return this.getInvocationCount(id);
   }
 
   /**
    * Asserts that a key is permitted for NEW encryption operations.
    * Throws RetiredKeyEncryptionError if the key has been retired.
    * Throws NistIvLimitExceededError if the key has reached the 2^32 NIST boundary.
+   * Throws DistributedAccountingUnavailableError if distributed accounting is required but unavailable.
    */
   public assertCanEncrypt(keyId?: string): void {
     const id = keyId || this.metrics.activeKeyId;
     if (this.retiredKeysSet.has(id)) {
       throw new RetiredKeyEncryptionError(id);
+    }
+
+    if (this.requireDistributedAccounting) {
+      const client = this.getRedisClient();
+      if (!client) {
+        throw new DistributedAccountingUnavailableError(
+          `Encryption write blocked: Distributed accounting is required but Redis is offline/unreachable.`
+        );
+      }
     }
 
     const currentCount = this.getInvocationCount(id);
@@ -85,9 +202,62 @@ export class KeyRotationService {
   }
 
   /**
-   * Atomically records an encryption invocation for the given key.
-   * Synchronously increments in-memory count and asynchronously synchronizes with Redis
-   * when multi-instance cluster coordination is enabled.
+   * Asserts that a key is permitted for DECRYPTION operations.
+   * Decryption never fails due to retired status or accounting offline.
+   */
+  public assertCanDecrypt(keyId?: string): void {
+    const id = keyId || this.metrics.activeKeyId;
+    // Decryption does not generate IVs, so even retired or uncounted keys may decrypt
+    logger.debug('Key permitted for decryption', { keyId: id });
+  }
+
+  /**
+   * Asynchronously and atomically records an encryption invocation.
+   * In distributed mode, coordinates with Redis atomically before returning.
+   */
+  public async recordInvocationAsync(count = 1, keyId?: string): Promise<number> {
+    const id = keyId || this.metrics.activeKeyId;
+    this.assertCanEncrypt(id);
+
+    const client = this.getRedisClient();
+    if (client) {
+      try {
+        const redisKey = `medimate:gcm:invocations:${id}`;
+        const newCount = await client.incrby(redisKey, count);
+        this.memoryCounters.set(id, newCount);
+
+        if (id === this.metrics.activeKeyId) {
+          this.metrics.totalInvocations = newCount;
+        }
+
+        if (newCount > this.metrics.hardLimitInvocations) {
+          throw new NistIvLimitExceededError(id, newCount);
+        }
+
+        await this.persistLocalLedger();
+        return newCount;
+      } catch (err) {
+        if (err instanceof NistIvLimitExceededError) {
+          throw err;
+        }
+        if (this.requireDistributedAccounting) {
+          throw new DistributedAccountingUnavailableError(
+            `Encryption write blocked: Redis invocation increment failed: ${String(err)}`
+          );
+        }
+      }
+    } else if (this.requireDistributedAccounting) {
+      throw new DistributedAccountingUnavailableError(
+        'Encryption write blocked: Distributed accounting required but no Redis client is available.'
+      );
+    }
+
+    // Local / single-instance accounting
+    return this.recordInvocation(count, id);
+  }
+
+  /**
+   * Atomically records an encryption invocation for the given key synchronously.
    */
   public recordInvocation(count = 1, keyId?: string): number {
     const id = keyId || this.metrics.activeKeyId;
@@ -100,23 +270,46 @@ export class KeyRotationService {
       this.metrics.totalInvocations = current;
     }
 
-    // Multi-instance distributed synchronization via Redis
-    try {
-      const client = redisConnectionManager.getClient();
-      if (client && redisConnectionManager.getConnectionState().connected) {
-        const redisKey = `medimate:gcm:invocations:${id}`;
-        client.incrby(redisKey, count).catch((err) => {
-          logger.warn('Failed to increment distributed key invocation count in Redis', {
-            keyId: id,
-            error: err instanceof Error ? err.message : String(err),
-          });
-        });
-      }
-    } catch {
-      // In offline/single-instance mode, memory counter is authoritative
+    if (current > this.metrics.hardLimitInvocations) {
+      throw new NistIvLimitExceededError(id, current);
     }
 
+    // Trigger async sync to Redis and local ledger in background
+    const client = this.getRedisClient();
+    if (client) {
+      const redisKey = `medimate:gcm:invocations:${id}`;
+      client.incrby(redisKey, count).catch((err: unknown) => {
+        logger.warn('Failed to increment distributed key invocation count in Redis', {
+          keyId: id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }
+
+    this.persistLocalLedger().catch(() => {});
+
     return current;
+  }
+
+  private async persistLocalLedger(): Promise<void> {
+    if (!this.persistenceFilePath) return;
+    try {
+      const dir = path.dirname(this.persistenceFilePath);
+      if (!fs.existsSync(dir)) {
+        await fsp.mkdir(dir, { recursive: true, mode: 0o700 });
+      }
+      const data = {
+        updatedAt: new Date().toISOString(),
+        activeKeyId: this.metrics.activeKeyId,
+        counters: Object.fromEntries(this.memoryCounters.entries()),
+        retiredKeys: Array.from(this.retiredKeysSet),
+      };
+      await fsp.writeFile(this.persistenceFilePath, JSON.stringify(data, null, 2), {
+        mode: 0o600,
+      });
+    } catch {
+      // Non-fatal for ephemeral ledger writes
+    }
   }
 
   public getInvocationCount(keyId?: string): number {
@@ -172,6 +365,8 @@ export class KeyRotationService {
       timestamp: new Date().toISOString(),
       retiredKeysCount: this.retiredKeysSet.size,
     });
+
+    this.persistLocalLedger().catch(() => {});
 
     return { oldKeyId, newKeyId: nextKeyId };
   }

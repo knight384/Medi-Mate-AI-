@@ -35,6 +35,7 @@ def readiness_check():
             "embedding_provider": settings.embedding_provider,
             "vector_store": settings.vector_store_backend,
             "scratch_dir": "ok",
+            "replay_registry": "redis" if settings.redis_url else "memory",
         },
     )
 

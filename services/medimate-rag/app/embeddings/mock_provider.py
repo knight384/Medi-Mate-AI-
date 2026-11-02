@@ -24,6 +24,8 @@ class DeterministicEmbeddingProvider(BaseEmbeddingProvider):
     Cosine similarities naturally correlate with semantic and lexical overlap while eliminating bucket collisions.
     """
 
+    default_threshold = 0.07
+
     def __init__(self, dimension: int = 1536, model_name: str = "deterministic-semantic-mock-1536"):
         self.dimension = dimension
         self.model_name = model_name

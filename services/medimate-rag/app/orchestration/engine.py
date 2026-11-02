@@ -48,13 +48,23 @@ class RAGEngine:
         chunker: Optional[ClinicalDocumentChunker] = None,
         parser: Optional[PDFDocumentParser] = None,
     ):
-        self.vector_store = vector_store or MemoryVectorStore()
+        if vector_store:
+            self.vector_store = vector_store
+        elif settings.vector_store_backend == "pgvector" and settings.database_url:
+            from app.storage.postgres_store import PostgresVectorStore
+            self.vector_store = PostgresVectorStore(settings.database_url)
+        else:
+            if settings.environment in ("staging", "production"):
+                raise ValueError("MemoryVectorStore is forbidden in production/staging environments")
+            self.vector_store = MemoryVectorStore()
 
         if embedding_provider:
             self.embedding_provider = embedding_provider
         elif settings.embedding_provider == "local":
             self.embedding_provider = LocalEmbeddingProvider(settings.embedding_model_name)
         else:
+            if settings.environment in ("staging", "production"):
+                raise ValueError("Deterministic mock embeddings are forbidden in production/staging")
             self.embedding_provider = DeterministicEmbeddingProvider(
                 dimension=settings.embedding_dimensions
             )
@@ -118,7 +128,11 @@ class RAGEngine:
         document_ids: Optional[List[str]] = None,
     ) -> RAGQueryResult:
         k = top_k or settings.default_top_k
-        threshold = similarity_threshold if similarity_threshold is not None else settings.similarity_threshold
+        threshold = (
+            similarity_threshold
+            if similarity_threshold is not None
+            else getattr(self.embedding_provider, "default_threshold", settings.similarity_threshold)
+        )
 
         # 1. Generate query embedding
         query_emb = self.embedding_provider.embed_query(query_text)

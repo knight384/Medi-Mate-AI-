@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from app.core.config import settings
 from app.core.errors import AuthenticationError, ForbiddenOperationError
 from app.core.logging import logger
+from app.security.replay import get_replay_registry
 
 
 class InternalServiceClaims(BaseModel):
@@ -184,7 +185,8 @@ def verify_service_assertion(
         )
 
     # Replay protection check
-    if _replay_cache.is_replayed(claims.nonce, claims.exp):
+    registry = get_replay_registry()
+    if not registry.register_nonce(claims.nonce, claims.exp):
         logger.warning(
             "Service assertion replay detected",
             extra={"structured_data": {"nonce": claims.nonce, "sub": claims.sub}}

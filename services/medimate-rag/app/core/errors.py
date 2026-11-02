@@ -76,3 +76,21 @@ class PromptInjectionDetectedError(RAGException):
             status_code=400,
             error_code="PROMPT_INJECTION_DETECTED",
         )
+
+
+class EmbeddingError(RAGException):
+    def __init__(self, message: str = "Failed to generate vector embeddings"):
+        super().__init__(
+            message=message,
+            status_code=500,
+            error_code="EMBEDDING_GENERATION_FAILED",
+        )
+
+
+class StorageError(RAGException):
+    def __init__(self, message: str = "Vector storage operation failure"):
+        super().__init__(
+            message=message,
+            status_code=500,
+            error_code="STORAGE_OPERATION_FAILED",
+        )

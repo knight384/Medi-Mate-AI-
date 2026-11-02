@@ -52,8 +52,8 @@ def build_evidence_attribution(
         doc_names.add(doc_name)
         pages.add(c.page_number)
 
-        # Create concise excerpt (first 180 chars)
-        excerpt = c.content[:180] + ("..." if len(c.content) > 180 else "")
+        # Create concise excerpt (first 350 chars)
+        excerpt = c.content[:350] + ("..." if len(c.content) > 350 else "")
 
         citations.append(
             Citation(

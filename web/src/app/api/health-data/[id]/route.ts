@@ -8,7 +8,7 @@ import { readBoundedJson } from '@/lib/security/request-boundary';
 import { validateStructuralBounds } from '@/lib/security/structural-boundary';
 import { localStorageDriver, isValidStorageKey } from '@/lib/storage';
 import { withTenantContext } from '@/lib/db-tenant';
-import { ragClient } from '@/lib/rag/rag-client';
+import { ragOutbox } from '@/lib/rag/rag-outbox';
 import { logger } from '@/lib/logger';
 
 export interface HealthDataPatchRequest {
@@ -179,14 +179,15 @@ export async function DELETE(
     });
     await cacheService.delete(`health-data:${id}`);
 
-    // 4. Propagate deletion to RAG microservice vector index
+    // 4. Enqueue durable deletion in RAG outbox and execute immediately
     try {
-      await ragClient.deleteDocumentIndex({
+      const event = await ragOutbox.enqueueDelete({
         userId: session.user.id,
         documentId: id,
       });
+      await ragOutbox.executeEvent(event.id);
     } catch (ragDelErr) {
-      logger.warn('Failed to propagate document deletion to RAG index', {
+      logger.warn('Initial RAG outbox deletion failed; queued for background retry', {
         id,
         error: (ragDelErr as Error).message,
       });

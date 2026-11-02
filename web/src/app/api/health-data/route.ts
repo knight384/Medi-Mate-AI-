@@ -15,7 +15,7 @@ import {
 import { withTenantContext } from '@/lib/db-tenant';
 import { readBoundedMultipart } from '@/lib/storage/multipart-reader';
 import { checkRateLimit } from '@/lib/security/rate-limiter';
-import { ragClient } from '@/lib/rag/rag-client';
+import { ragOutbox } from '@/lib/rag/rag-outbox';
 
 export interface HealthData extends Prisma.HealthDataGetPayload<{
     select: {
@@ -205,24 +205,17 @@ export async function POST(req: NextRequest) {
                 });
             });
 
-            // Dispatch document to Python RAG service for semantic chunking & vector indexing
+            // Enqueue document into durable RAG outbox and attempt immediate indexing
             try {
-                if (await localStorageDriver.exists(storageKey)) {
-                    const chunks: Buffer[] = [];
-                    const readResult = await localStorageDriver.readStream(storageKey);
-                    for await (const chunk of readResult.stream) {
-                        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-                    }
-                    const decryptedBuffer = Buffer.concat(chunks);
-                    await ragClient.ingestDocument({
-                        userId,
-                        documentId: healthData!.id,
-                        fileName: file.safeName,
-                        fileBuffer: decryptedBuffer,
-                    });
-                }
+                const event = await ragOutbox.enqueueIngest({
+                    userId,
+                    documentId: healthData!.id,
+                    fileName: file.safeName,
+                    storageKey,
+                });
+                await ragOutbox.executeEvent(event.id);
             } catch (ragErr) {
-                logger.warn('Asynchronous RAG document indexing failed', {
+                logger.warn('Initial RAG outbox dispatch failed; queued for background retry', {
                     documentId: healthData!.id,
                     error: (ragErr as Error).message,
                 });

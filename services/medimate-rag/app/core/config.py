@@ -48,7 +48,7 @@ class Settings(BaseSettings):
         default="deterministic", description="Embedding provider type"
     )
     embedding_model_name: str = Field(
-        default="sentence-transformers/all-MiniLM-L6-v2",
+        default="BAAI/bge-small-en-v1.5",
         description="Embedding model identifier",
     )
     embedding_dimensions: int = Field(
@@ -60,7 +60,12 @@ class Settings(BaseSettings):
         default="memory", description="Vector database backend"
     )
     database_url: Optional[str] = Field(
-        default=None, description="PostgreSQL database URL for pgvector"
+        default=None, description="PostgreSQL database URL for persistent vector store"
+    )
+
+    # Distributed Redis Settings
+    redis_url: Optional[str] = Field(
+        default=None, description="Redis URL for distributed assertion replay protection"
     )
 
     # RAG Retrieval Defaults
@@ -85,6 +90,17 @@ class Settings(BaseSettings):
         if len(v) < 16:
             raise ValueError("INTERNAL_SERVICE_SECRET must be at least 16 characters (32+ recommended)")
         return v
+
+    def model_post_init(self, __context) -> None:
+        if self.environment in ("staging", "production"):
+            if self.embedding_provider == "deterministic":
+                raise ValueError("Deterministic mock embeddings are strictly prohibited in production/staging environments")
+            if self.vector_store_backend == "memory":
+                raise ValueError("MemoryVectorStore is strictly prohibited in production/staging environments. Use pgvector.")
+            if not self.database_url:
+                raise ValueError("DATABASE_URL is required in production/staging for persistent vector storage")
+            if not self.redis_url:
+                raise ValueError("REDIS_URL is required in production/staging for distributed replay protection")
 
 
 settings = Settings()

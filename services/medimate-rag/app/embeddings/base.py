@@ -12,9 +12,12 @@ class EmbeddingMetadata(BaseModel):
     dimension: int
     normalized: bool = True
     provider_type: str
+    version: str = "1.0"
 
 
 class BaseEmbeddingProvider(ABC):
+    default_threshold: float = 0.25
+
     @abstractmethod
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         """Generates normalized vector embeddings for a list of document chunks."""

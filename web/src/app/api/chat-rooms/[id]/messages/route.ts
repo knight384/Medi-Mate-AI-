@@ -12,6 +12,7 @@ import { handleApiError, AppError } from "@/lib/errors";
 import { withTenantContext } from "@/lib/db-tenant";
 import { buildClinicalSystemPrompt } from "@/lib/clinical/emergency-guidance";
 import { checkRateLimit } from "@/lib/security/rate-limiter";
+import { ConsentAndPrivacyPolicy } from "@/lib/ai/consent-policy";
 
 export interface ChatMessage extends Prisma.ChatMessageGetPayload<{
     select: {
@@ -151,11 +152,26 @@ export async function POST(
         patientDataSummary: healthDataList.map((data) => JSON.stringify(data.data)).join('\n'),
     });
 
+    // Validate deployment profile and privacy consent if targeting a cloud AI provider
+    if (llmProvider.providerId !== 'ollama') {
+        const userConsentHeader = req.headers.get('x-consent-cloud-processing');
+        const allowCloudProcessing = userConsentHeader === 'true';
+
+        ConsentAndPrivacyPolicy.assertCanProcessInCloud({
+            taskType: 'clinical_query',
+            sensitivity: 'HIGHLY_SENSITIVE_PHI',
+            userConsent: {
+                userId: session?.user?.id || '',
+                allowCloudProcessing,
+            },
+        });
+    }
+
     const selectedModel = chatRoom.llmProviderModelId ?? undefined;
     let chatModel: ChatOpenAI | ChatAnthropic | ChatGoogleGenerativeAI
     if (llmProvider.providerId === 'openai') {
         chatModel = new ChatOpenAI({
-            apiKey: currentDeploymentEnv === 'cloud' ? process.env.OPENAI_API_KEY : decryptedApiKey,
+            apiKey: (currentDeploymentEnv === 'cloud' ? process.env.OPENAI_API_KEY : decryptedApiKey) || decryptedApiKey || process.env.OPENAI_API_KEY,
             model: selectedModel,
             configuration: {
                 baseURL: llmProvider.apiURL
@@ -163,7 +179,7 @@ export async function POST(
         });
     } else if (llmProvider.providerId === 'anthropic') {
         chatModel = new ChatAnthropic({
-            apiKey: currentDeploymentEnv === 'cloud' ? process.env.ANTHROPIC_API_KEY : decryptedApiKey,
+            apiKey: (currentDeploymentEnv === 'cloud' ? process.env.ANTHROPIC_API_KEY : decryptedApiKey) || decryptedApiKey || process.env.ANTHROPIC_API_KEY,
             model: selectedModel,
             clientOptions: {
                 baseURL: llmProvider.apiURL
@@ -171,7 +187,7 @@ export async function POST(
         });
     } else if (llmProvider.providerId === 'google') {
         chatModel = new ChatGoogleGenerativeAI({
-            apiKey: currentDeploymentEnv === 'cloud' ? process.env.GOOGLE_API_KEY : decryptedApiKey,
+            apiKey: (currentDeploymentEnv === 'cloud' ? process.env.GOOGLE_API_KEY : decryptedApiKey) || decryptedApiKey || process.env.GOOGLE_API_KEY,
             model: selectedModel,
         });
     } else if (llmProvider.providerId === 'ollama') {

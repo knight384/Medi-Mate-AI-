@@ -83,7 +83,7 @@ export class DoclingDocumentParser extends BaseDocumentParser {
     }
 
     get enabled(): boolean {
-        return currentDeploymentEnv === 'local';
+        return currentDeploymentEnv === 'local' || currentDeploymentEnv === 'hybrid' || Boolean(process.env.DOCLING_URL);
     }
 
     get name(): string {

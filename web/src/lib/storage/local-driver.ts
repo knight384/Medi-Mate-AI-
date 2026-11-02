@@ -10,6 +10,8 @@ import { AppError, NotFoundError, ValidationError } from '@/lib/errors';
 import { logger } from '@/lib/logger';
 import { getEncryptionKey } from '@/lib/encryption';
 
+import { StorageDriver } from './storage-driver.interface';
+
 export interface StoredObjectMetadata {
   storageKey: string;
   size: number;
@@ -72,7 +74,8 @@ export interface WriteStreamOptions {
   keyId?: string;
 }
 
-export class LocalStorageDriver {
+export class LocalStorageDriver implements StorageDriver {
+  public readonly driverType = 'local' as const;
   private readonly customStorageDir?: string;
   private readonly keyring: Map<string, Buffer>;
   private readonly activeKeyId: string;

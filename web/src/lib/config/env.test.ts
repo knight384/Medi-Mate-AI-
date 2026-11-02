@@ -17,6 +17,10 @@ describe('env config', () => {
   it('loads deployment environment from DEPLOYMENT_ENV', () => {
     process.env.DEPLOYMENT_ENV = 'cloud';
     expect(getDeploymentEnv()).toBe('cloud');
+
+    resetEnvCache();
+    process.env.DEPLOYMENT_ENV = 'hybrid';
+    expect(getDeploymentEnv()).toBe('hybrid');
   });
 
   it('defaults deployment environment to local', () => {

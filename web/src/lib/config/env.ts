@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-const deploymentEnvSchema = z.enum(['local', 'cloud']);
+const deploymentEnvSchema = z.enum(['local', 'cloud', 'hybrid']);
 
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),

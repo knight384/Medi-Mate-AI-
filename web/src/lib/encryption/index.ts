@@ -238,3 +238,10 @@ if (process.env.NEXT_PHASE !== PHASE_PRODUCTION_BUILD) {
     // Allows importing in environments where process.env is configured per-test
   }
 }
+
+export * from './format-spec';
+export * from './key-providers';
+export * from './envelope-service';
+export * from './key-rotation-service';
+export * from './kms-adapter';
+export * from './migrate-ciphertext';

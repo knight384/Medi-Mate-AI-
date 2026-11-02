@@ -1,0 +1,26 @@
+services:
+  medimate-rag:
+    image: medimate-rag:phase6
+    container_name: medimate-phase6-rag-1
+    restart: "no"
+    ports:
+      - "127.0.0.1:8001:8000"
+    environment:
+      - INTERNAL_SERVICE_SECRET=phase6_secret_verification_key_for_testing_purposes_only
+      - EMBEDDING_PROVIDER=deterministic
+      - SIMILARITY_THRESHOLD=0.05
+      - ENVIRONMENT=production
+    tmpfs:
+      - /tmp/rag-scratch:size=64m,mode=1777
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks:
+      - medimate-phase6-net
+
+networks:
+  medimate-phase6-net:
+    driver: bridge

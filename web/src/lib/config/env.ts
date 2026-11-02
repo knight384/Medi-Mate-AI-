@@ -41,6 +41,8 @@ const envSchema = z.object({
   AWS_REGION: z.string().optional(),
   AWS_KMS_KEY_ARN: z.string().optional(),
   AWS_KMS_ENDPOINT: z.string().optional(),
+  RAG_SERVICE_URL: z.string().default('http://localhost:8001'),
+  INTERNAL_SERVICE_SECRET: z.string().default('local-dev-medimate-internal-secret-32-chars-min!'),
 });
 
 export type DeploymentEnv = z.infer<typeof deploymentEnvSchema>;

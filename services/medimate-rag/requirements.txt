@@ -1,0 +1,13 @@
+# MediMate AI — RAG Microservice Pinned Requirements
+# Python 3.11+
+fastapi==0.162.0
+uvicorn==0.54.0
+pydantic==2.14.2
+pydantic-settings==2.16.2
+python-multipart==0.0.33
+pypdf==6.21.4
+httpx==0.28.1
+numpy>=2.0.0,<3.0.0
+starlette==1.10.0
+pytest==9.2.0
+python-dotenv==1.2.4

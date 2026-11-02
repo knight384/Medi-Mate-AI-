@@ -13,6 +13,7 @@ import { withTenantContext } from "@/lib/db-tenant";
 import { buildClinicalSystemPrompt } from "@/lib/clinical/emergency-guidance";
 import { checkRateLimit } from "@/lib/security/rate-limiter";
 import { ConsentAndPrivacyPolicy } from "@/lib/ai/consent-policy";
+import { ragClient } from "@/lib/rag/rag-client";
 
 export interface ChatMessage extends Prisma.ChatMessageGetPayload<{
     select: {
@@ -146,10 +147,30 @@ export async function POST(
 
     const userRegion = req.headers.get('x-user-region') || undefined;
 
+    // Retrieve relevant clinical records from Python RAG microservice
+    let ragContext = '';
+    try {
+        const ragRes = await ragClient.queryRAG({
+            userId,
+            query: body.content,
+            topK: 4,
+        });
+        if (ragRes && ragRes.citations && ragRes.citations.length > 0) {
+            ragContext = '\n\nRELEVANT RETRIEVED MEDICAL RECORDS:\n' +
+                ragRes.citations
+                    .map((c) => `[Document: ${c.document_name}, Page: ${c.page_number}, Section: ${c.section_heading}]:\n${c.excerpt}`)
+                    .join('\n\n');
+        }
+    } catch {
+        // Fall back gracefully if RAG service is offline or unprovisioned
+    }
+
+    const patientSummary = healthDataList.map((data) => JSON.stringify(data.data)).join('\n') + ragContext;
+
     const systemPrompt = buildClinicalSystemPrompt({
         regionCode: userRegion,
         assistantPrompt: assistantMode.systemPrompt,
-        patientDataSummary: healthDataList.map((data) => JSON.stringify(data.data)).join('\n'),
+        patientDataSummary: patientSummary,
     });
 
     // Validate deployment profile and privacy consent if targeting a cloud AI provider

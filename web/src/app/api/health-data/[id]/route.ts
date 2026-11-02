@@ -8,6 +8,7 @@ import { readBoundedJson } from '@/lib/security/request-boundary';
 import { validateStructuralBounds } from '@/lib/security/structural-boundary';
 import { localStorageDriver, isValidStorageKey } from '@/lib/storage';
 import { withTenantContext } from '@/lib/db-tenant';
+import { ragClient } from '@/lib/rag/rag-client';
 import { logger } from '@/lib/logger';
 
 export interface HealthDataPatchRequest {
@@ -177,6 +178,20 @@ export async function DELETE(
       await tx.healthData.delete({ where: { id } });
     });
     await cacheService.delete(`health-data:${id}`);
+
+    // 4. Propagate deletion to RAG microservice vector index
+    try {
+      await ragClient.deleteDocumentIndex({
+        userId: session.user.id,
+        documentId: id,
+      });
+    } catch (ragDelErr) {
+      logger.warn('Failed to propagate document deletion to RAG index', {
+        id,
+        error: (ragDelErr as Error).message,
+      });
+    }
+
     return NextResponse.json({ success: true });
   } catch (error) {
     return handleApiError(error);

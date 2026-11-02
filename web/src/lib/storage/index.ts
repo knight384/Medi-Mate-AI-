@@ -17,3 +17,4 @@ export * from './local-driver';
 export * from './storage-driver.interface';
 export * from './cloud-driver';
 export * from './hybrid-policy';
+export * from './temp-storage';

@@ -66,6 +66,8 @@ services:
     volumes:
       - app_storage:/app/storage
       - app_data:/app/legacy_uploads:ro
+    tmpfs:
+      - /app/scratch:size=512m,mode=1777
     ports:
       - "3000:3000"
     restart: always
@@ -74,6 +76,7 @@ services:
       REDIS_URL: redis://redis:6379
       REDIS_ENABLED: "true"
       MEDIMATE_STORAGE_DIR: /app/storage
+      MEDIMATE_SCRATCH_DIR: /app/scratch
 
 volumes:
   postgres_data:

@@ -11,6 +11,7 @@ import { logger } from '@/lib/logger';
 import { getEncryptionKey } from '@/lib/encryption';
 
 import { StorageDriver } from './storage-driver.interface';
+import { ProtectedScratchStorage, protectedScratchStorage } from './temp-storage';
 
 export interface StoredObjectMetadata {
   storageKey: string;
@@ -63,15 +64,29 @@ export const HEADER_SIZE_V2 = 36;
 export const HEADER_SIZE_V3 = 40;
 export const DEFAULT_KEY_ID = 'k001';
 
+/**
+ * Validates encryption key identifier against path traversal and malicious lookup characters.
+ */
+export function validateKeyId(keyId: string): void {
+  if (!keyId || typeof keyId !== 'string') {
+    throw new StorageSecurityError('Key identifier must be a non-empty string');
+  }
+  if (keyId !== keyId.trim() || !/^[a-zA-Z0-9_-]{1,64}$/.test(keyId)) {
+    throw new StorageSecurityError(`Invalid encryption key identifier format: ${keyId}`);
+  }
+}
+
 export interface LocalStorageDriverOptions {
   customStorageDir?: string;
   keyring?: Map<string, Buffer>;
   activeKeyId?: string;
+  scratchStorage?: ProtectedScratchStorage;
 }
 
 export interface WriteStreamOptions {
   version?: 'MM_ENC02' | 'MM_ENC03';
   keyId?: string;
+  bindVersionAndKeyIdInAAD?: boolean;
 }
 
 export class LocalStorageDriver implements StorageDriver {
@@ -79,6 +94,7 @@ export class LocalStorageDriver implements StorageDriver {
   private readonly customStorageDir?: string;
   private readonly keyring: Map<string, Buffer>;
   private readonly activeKeyId: string;
+  private readonly scratchStorage: ProtectedScratchStorage;
 
   constructor(
     optionsOrDir?: string | LocalStorageDriverOptions,
@@ -86,6 +102,8 @@ export class LocalStorageDriver implements StorageDriver {
     activeKeyIdArg = DEFAULT_KEY_ID
   ) {
     let customStorageDir: string | undefined;
+    let customScratch: ProtectedScratchStorage | undefined;
+
     if (typeof optionsOrDir === 'string') {
       customStorageDir = optionsOrDir;
       this.keyring = keyringArg ? new Map(keyringArg) : new Map();
@@ -94,10 +112,13 @@ export class LocalStorageDriver implements StorageDriver {
       customStorageDir = optionsOrDir.customStorageDir;
       this.keyring = optionsOrDir.keyring ? new Map(optionsOrDir.keyring) : new Map();
       this.activeKeyId = optionsOrDir.activeKeyId || DEFAULT_KEY_ID;
+      customScratch = optionsOrDir.scratchStorage;
     } else {
       this.keyring = new Map();
       this.activeKeyId = DEFAULT_KEY_ID;
     }
+
+    validateKeyId(this.activeKeyId);
 
     // Ensure active key is populated in keyring
     if (!this.keyring.has(this.activeKeyId)) {
@@ -109,7 +130,19 @@ export class LocalStorageDriver implements StorageDriver {
     }
 
     this.customStorageDir = customStorageDir;
+    this.scratchStorage =
+      customScratch ||
+      (customStorageDir
+        ? new ProtectedScratchStorage({
+            customScratchDir: path.join(customStorageDir, '.scratch'),
+          })
+        : protectedScratchStorage);
+
     this.validateRoot(this.getStorageRoot());
+  }
+
+  public getScratchStorage(): ProtectedScratchStorage {
+    return this.scratchStorage;
   }
 
   /**
@@ -117,6 +150,7 @@ export class LocalStorageDriver implements StorageDriver {
    */
   public getKey(keyId: string): Buffer {
     const trimmedId = keyId.trim();
+    validateKeyId(trimmedId);
     let key = this.keyring.get(trimmedId);
     if (!key && (trimmedId === DEFAULT_KEY_ID || trimmedId === '')) {
       key = getEncryptionKey();
@@ -133,6 +167,7 @@ export class LocalStorageDriver implements StorageDriver {
   }
 
   public registerKey(keyId: string, key: Buffer): void {
+    validateKeyId(keyId);
     if (key.length !== 32) {
       throw new StorageSecurityError(`Invalid encryption key length: expected 32 bytes, got ${key.length}`);
     }
@@ -203,10 +238,17 @@ export class LocalStorageDriver implements StorageDriver {
    * @returns Number of orphaned temporary files deleted
    */
   public async cleanupOrphanedTempFiles(maxAgeMs: number = 15 * 60 * 1000): Promise<number> {
+    let cleanedCount = 0;
+    try {
+      const scratchResult = await this.scratchStorage.cleanupOrphanedScratch();
+      cleanedCount += scratchResult.cleanedFiles;
+    } catch {
+      // Ignore scratch cleanup error
+    }
+
     try {
       const entries = await fsp.readdir(this.tempDir, { withFileTypes: true });
       const now = Date.now();
-      let cleanedCount = 0;
 
       for (const entry of entries) {
         if (entry.isFile() && (entry.name.endsWith('.tmp') || entry.name.includes('.quarantine'))) {
@@ -229,12 +271,12 @@ export class LocalStorageDriver implements StorageDriver {
       return cleanedCount;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-        return 0;
+        return cleanedCount;
       }
       logger.warn('Failed to clean up orphaned temporary files in storage', {
         error: err instanceof Error ? err.message : String(err),
       });
-      return 0;
+      return cleanedCount;
     }
   }
 
@@ -497,9 +539,9 @@ export class LocalStorageDriver implements StorageDriver {
     const key = this.getKey(keyId);
     await this.init();
 
-    // Quarantine Decryption: decrypt completely into private temporary quarantine file
-    const quarantineFileName = `${crypto.randomUUID()}.quarantine.tmp`;
-    const quarantinePath = path.join(this.tempDir, quarantineFileName);
+    // Quarantine Decryption: decrypt into private isolated scratch storage
+    const { filePath: quarantinePath, release: releaseQuarantine } =
+      await this.scratchStorage.allocateFile('quarantine', '.quarantine.tmp', 'stream_verification');
 
     const decipher = crypto.createDecipheriv('aes-256-gcm', key, nonce);
     decipher.setAAD(Buffer.from(storageKey, 'utf8'));
@@ -515,7 +557,7 @@ export class LocalStorageDriver implements StorageDriver {
       await pipeline(cipherStream, decipher, quarantineWriteStream);
     } catch (pipelineErr) {
       // Immediately purge quarantine file on any authentication error
-      await fsp.unlink(quarantinePath).catch(() => {});
+      await releaseQuarantine().catch(() => {});
       throw new StorageSecurityError(
         `Cryptographic authentication failed: document ciphertext on disk has been tampered with or corrupted (${(pipelineErr as Error).message})`
       );
@@ -530,7 +572,7 @@ export class LocalStorageDriver implements StorageDriver {
     const cleanupQuarantine = () => {
       if (!unlinked) {
         unlinked = true;
-        fsp.unlink(quarantinePath).catch(() => {});
+        releaseQuarantine().catch(() => {});
       }
     };
     verifiedStream.on('close', cleanupQuarantine);
@@ -561,7 +603,7 @@ export class LocalStorageDriver implements StorageDriver {
 
   /**
    * Decrypts document stream to a short-lived temporary file with restrictive permissions (0600)
-   * within private storage .tmp directory, executes the provided worker callback, and cleans up
+   * within protected scratch storage, executes the provided worker callback, and cleans up
    * the temporary plaintext file deterministically in a finally block.
    *
    * Plaintext file is ONLY created and passed to fn after GCM authentication completes successfully.
@@ -571,8 +613,11 @@ export class LocalStorageDriver implements StorageDriver {
     fn: (tempPlaintextPath: string) => Promise<T>
   ): Promise<T> {
     await this.init();
-    const tempFileName = `${crypto.randomUUID()}_plain.tmp`;
-    const tempPlaintextPath = path.join(this.tempDir, tempFileName);
+    const { filePath: tempPlaintextPath, release } = await this.scratchStorage.allocateFile(
+      'decrypted',
+      '_plain.tmp',
+      'withDecryptedTempFile'
+    );
 
     const { stream } = await this.readStream(storageKey);
     const writeStream = fs.createWriteStream(tempPlaintextPath, {
@@ -584,7 +629,7 @@ export class LocalStorageDriver implements StorageDriver {
       await pipeline(stream, writeStream);
       return await fn(tempPlaintextPath);
     } finally {
-      await fsp.unlink(tempPlaintextPath).catch(() => {});
+      await release();
     }
   }
 

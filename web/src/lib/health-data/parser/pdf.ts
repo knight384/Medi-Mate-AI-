@@ -12,11 +12,10 @@ import {currentDeploymentEnv} from "@/lib/current-deployment-env";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
-import crypto from "node:crypto";
 import {fromBuffer as pdf2picFromBuffer} from 'pdf2pic';
 import {tasks} from "@trigger.dev/sdk/v3";
 import type {pdfToImages} from "@/trigger/pdf-to-image";
-import {localStorageDriver, isValidStorageKey} from "@/lib/storage";
+import {localStorageDriver, isValidStorageKey, protectedScratchStorage} from "@/lib/storage";
 
 interface VisionParserOptions {
     parser: string;
@@ -211,7 +210,11 @@ async function inference(inferenceOptions: InferenceOptions) {
  * - Writes temporary page images to private storage temp directory outside web/public/
  * - Returns paths and temp directory for lifecycle cleanup
  */
-async function documentToImages({file: filePath}: Pick<SourceParseOptions, 'file'>): Promise<{ imagePaths: string[]; tempDir: string }> {
+async function documentToImages({file: filePath}: Pick<SourceParseOptions, 'file'>): Promise<{
+    imagePaths: string[];
+    tempDir: string;
+    releaseTempDir?: () => Promise<void>;
+}> {
     const fileBuffer = await loadFileBuffer(filePath);
     const result = await fileTypeFromBuffer(fileBuffer);
     if (!result) throw new Error('Invalid file type');
@@ -241,18 +244,18 @@ async function documentToImages({file: filePath}: Pick<SourceParseOptions, 'file
         images.push(`data:${mime};base64,${fileBuffer.toString('base64')}`);
     }
 
-    // Write image data to a private temporary directory outside web/public/
-    const tempDir = path.join(localStorageDriver.getStorageRoot(), '.tmp', `ocr_${crypto.randomUUID()}`);
-    await fsp.mkdir(tempDir, { recursive: true, mode: 0o700 });
+    // Write image data to protected scratch storage (RAM-backed tmpfs where available)
+    const { dirPath: tempDir, release: releaseTempDir } =
+        await protectedScratchStorage.allocateDir('ocr_scratch', 'pdf_page_extraction');
 
     const imagePaths: string[] = [];
     for (let i = 0; i < images.length; i++) {
         const pagePath = path.join(tempDir, `page_${i}.png`);
-        await fsp.writeFile(pagePath, Buffer.from(images[i].split(',')[1], 'base64'));
+        await fsp.writeFile(pagePath, Buffer.from(images[i].split(',')[1], 'base64'), { mode: 0o600 });
         imagePaths.push(pagePath);
     }
 
-    return { imagePaths, tempDir };
+    return { imagePaths, tempDir, releaseTempDir };
 }
 
 /**
@@ -276,7 +279,7 @@ export async function parseHealthData(options: SourceParseOptions) {
     }
 
     // Prepare images and track temporary directory
-    const { imagePaths, tempDir } = await documentToImages({file: filePath});
+    const { imagePaths, tempDir, releaseTempDir } = await documentToImages({file: filePath});
 
     try {
         // Prepare ocr results
@@ -374,12 +377,18 @@ export async function parseHealthData(options: SourceParseOptions) {
 
         return {data: [healthCheckup], pages: [mergedPageResult], ocrResults: [ocrResults]}
     } finally {
-        // Guaranteed cleanup of temporary page images outside web/public/
-        if (tempDir) {
+        // Guaranteed cleanup of temporary scratch page images and lease release
+        if (releaseTempDir) {
+            try {
+                await releaseTempDir();
+            } catch {
+                // Ignore cleanup error if already removed
+            }
+        } else if (tempDir) {
             try {
                 await fsp.rm(tempDir, { recursive: true, force: true });
             } catch {
-                // Ignore cleanup error if already removed
+                // Ignore
             }
         }
     }

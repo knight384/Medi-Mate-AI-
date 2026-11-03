@@ -53,3 +53,54 @@ export function createInternalServiceAssertion(options: ServiceAssertionOptions)
 
   return `${signingInput}.${signatureB64}`;
 }
+
+export interface VerifiedAssertion {
+  userId: string;
+  tenantId: string;
+  operation: string;
+  resourceId?: string | null;
+  purpose?: string;
+  issuedAt: number;
+  expiresAt: number;
+}
+
+/**
+ * Validates and decodes an internal HMAC-SHA256 service assertion token.
+ * Rejects expired, tampered, or invalid tokens fail-closed.
+ */
+export function verifyInternalServiceAssertion(
+  token: string,
+  secret?: string
+): VerifiedAssertion {
+  const env = getEnv();
+  const effectiveSecret = secret || env.INTERNAL_SERVICE_SECRET;
+  const parts = token.split('.');
+  if (parts.length !== 3) {
+    throw new Error('Invalid assertion token format');
+  }
+  const [headerB64, payloadB64, signatureB64] = parts;
+  const signingInput = `${headerB64}.${payloadB64}`;
+  const hmac = crypto.createHmac('sha256', effectiveSecret);
+  hmac.update(signingInput);
+  const expectedSigB64 = base64UrlEncode(hmac.digest());
+
+  if (!crypto.timingSafeEqual(Buffer.from(signatureB64), Buffer.from(expectedSigB64))) {
+    throw new Error('Assertion signature verification failed');
+  }
+
+  const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
+  const now = Math.floor(Date.now() / 1000);
+  if (payload.exp && payload.exp < now) {
+    throw new Error('Assertion token expired');
+  }
+
+  return {
+    userId: payload.sub,
+    tenantId: payload.tenantId || payload.sub,
+    operation: payload.op,
+    resourceId: payload.resourceId,
+    purpose: payload.purpose,
+    issuedAt: payload.iat,
+    expiresAt: payload.exp,
+  };
+}

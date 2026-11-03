@@ -53,6 +53,21 @@ export class WearableConsentService {
 
     const now = new Date();
 
+    if (!process.env.DATABASE_URL) {
+      const mapped: ConsentRecord = {
+        id: `mock_consent_${params.userId}_${params.providerId}`,
+        userId: params.userId,
+        providerId: params.providerId,
+        categories: params.categories,
+        purpose: params.purpose,
+        status: 'ACTIVE',
+        grantedAt: now,
+        revokedAt: null,
+      };
+      inMemoryConsentCache.set(getCacheKey(params.userId, params.providerId), mapped);
+      return mapped;
+    }
+
     try {
       const record = await prisma.wearableConsent.upsert({
         where: {
@@ -127,6 +142,11 @@ export class WearableConsentService {
     userId: string,
     providerId: WearableProviderId
   ): Promise<ConsentRecord | null> {
+    if (!process.env.DATABASE_URL) {
+      const cached = inMemoryConsentCache.get(getCacheKey(userId, providerId));
+      return cached && cached.status === 'ACTIVE' ? cached : null;
+    }
+
     try {
       const record = await prisma.wearableConsent.findUnique({
         where: {
@@ -169,6 +189,15 @@ export class WearableConsentService {
     reason = 'USER_REVOKED'
   ): Promise<boolean> {
     const now = new Date();
+
+    if (!process.env.DATABASE_URL) {
+      const cached = inMemoryConsentCache.get(getCacheKey(userId, providerId));
+      if (cached) {
+        cached.status = 'REVOKED';
+        cached.revokedAt = now;
+      }
+      return true;
+    }
 
     try {
       await prisma.wearableConsent.update({
@@ -271,5 +300,12 @@ export class WearableConsentService {
     const consent = await this.getActiveConsent(userId, providerId);
     if (!consent) return [];
     return requestedCategories.filter((c) => consent.categories.includes(c));
+  }
+
+  /**
+   * Resets in-memory consent cache for testing isolation.
+   */
+  static _resetInMemoryCache(): void {
+    inMemoryConsentCache.clear();
   }
 }

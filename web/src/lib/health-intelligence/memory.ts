@@ -59,6 +59,25 @@ export class HealthMemoryService {
       throw new Error('Unconfirmed clinical diagnoses cannot be automatically saved into conversational memory.');
     }
 
+    if (!process.env.DATABASE_URL) {
+      const id = `mem_${userId}_${category}_${key}`;
+      const item: UserMemoryItem = {
+        id,
+        userId,
+        category,
+        key,
+        content,
+        sourceType,
+        sourceId,
+        confidence,
+        isPaused: false,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+      inMemoryMemoryStore.set(id, item);
+      return item;
+    }
+
     try {
       const existing = await prisma.userHealthMemory.findFirst({
         where: { userId, key, category },
@@ -131,6 +150,12 @@ export class HealthMemoryService {
     userId: string,
     category?: MemoryCategory
   ): Promise<UserMemoryItem[]> {
+    if (!process.env.DATABASE_URL) {
+      return Array.from(inMemoryMemoryStore.values()).filter(
+        (m) => m.userId === userId && !m.isPaused && (category ? m.category === category : true)
+      );
+    }
+
     try {
       const records = await prisma.userHealthMemory.findMany({
         where: {
@@ -170,6 +195,16 @@ export class HealthMemoryService {
     memoryId: string,
     isPaused: boolean
   ): Promise<boolean> {
+    if (!process.env.DATABASE_URL) {
+      const item = inMemoryMemoryStore.get(memoryId);
+      if (item && item.userId === userId) {
+        item.isPaused = isPaused;
+        item.updatedAt = new Date();
+        return true;
+      }
+      return false;
+    }
+
     try {
       await prisma.userHealthMemory.updateMany({
         where: { id: memoryId, userId },
@@ -191,6 +226,15 @@ export class HealthMemoryService {
    * Deletes a specific memory entry permanently.
    */
   static async deleteMemory(userId: string, memoryId: string): Promise<boolean> {
+    if (!process.env.DATABASE_URL) {
+      const item = inMemoryMemoryStore.get(memoryId);
+      if (item && item.userId === userId) {
+        inMemoryMemoryStore.delete(memoryId);
+        return true;
+      }
+      return false;
+    }
+
     try {
       const res = await prisma.userHealthMemory.deleteMany({
         where: { id: memoryId, userId },

@@ -203,4 +203,20 @@ export class WearableDeletionService {
       timestamp: now.toISOString(),
     };
   }
+
+  /**
+   * Complete purge wrapper executing deletion of observations, summaries, and RAG chunks.
+   */
+  static async purgeAllWearableData(params: {
+    userId: string;
+    tenantId?: string;
+    providerId: WearableProviderId;
+  }): Promise<{ success: boolean; providerId: WearableProviderId; result: DeletionResult }> {
+    const result = await this.deleteProviderHealthData(params.userId, params.providerId);
+    return {
+      success: true,
+      providerId: params.providerId,
+      result,
+    };
+  }
 }

@@ -25,6 +25,8 @@ model User {
   OAuth2Client            OAuth2Client[]
   OAuth2AuthorizationCode OAuth2AuthorizationCode[]
   OAuth2Token             OAuth2Token[]
+  wearableConnections     WearableConnection[]
+  wearableConsents        WearableConsent[]
 }
 
 model OAuth2Client {
@@ -74,17 +76,59 @@ model OAuth2Token {
 
 model HealthData {
   id        String   @id @default(cuid())
-  type      String // PERSONAL_INFO
+  type      String // PERSONAL_INFO, WEARABLE_OBSERVATION, WEARABLE_SUMMARY
   data      Json
   authorId  String?
   metadata  Json?
   filePath  String?
   fileType  String? // image/jpeg, image/png, application/pdf
-  status    String   @default("COMPLETED") // PARSING, COMPLETED
+  status    String   @default("COMPLETED") // PARSING, COMPLETED, DELETING
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   author User? @relation(fields: [authorId], references: [id])
+
+  @@index([authorId, type])
+}
+
+model WearableConnection {
+  id                    String    @id @default(cuid())
+  userId                String    @map("user_id")
+  providerId            String    @map("provider_id")
+  status                String    @default("CONNECTED") @map("status") // CONNECTED, REVOKED, DISCONNECTED, ERROR
+  encryptedAccessToken  String    @map("encrypted_access_token")
+  encryptedRefreshToken String?   @map("encrypted_refresh_token")
+  tokenExpiresAt        DateTime? @map("token_expires_at")
+  scope                 String    @default("") @map("scope")
+  externalUserId        String?   @map("external_user_id")
+  lastSyncAt            DateTime? @map("last_sync_at")
+  lastSyncStatus        String?   @map("last_sync_status")
+  syncCursor            String?   @map("sync_cursor")
+  createdAt             DateTime  @default(now()) @map("created_at")
+  updatedAt             DateTime  @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, providerId])
+  @@index([userId])
+}
+
+model WearableConsent {
+  id          String    @id @default(cuid())
+  userId      String    @map("user_id")
+  providerId  String    @map("provider_id")
+  categories  Json      @map("categories") // string array e.g. ["HEART", "ACTIVITY", "SLEEP", "VITALS"]
+  purpose     String    @map("purpose")
+  status      String    @default("ACTIVE") @map("status") // ACTIVE, REVOKED
+  grantedAt   DateTime  @default(now()) @map("granted_at")
+  revokedAt   DateTime? @map("revoked_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, providerId])
+  @@index([userId])
 }
 
 model ChatRoom {

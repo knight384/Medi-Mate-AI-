@@ -1,0 +1,67 @@
+services:
+  postgres:
+    image: postgres:16.15-alpine
+    container_name: medimate-phase7-postgres
+    restart: "no"
+    ports:
+      - "127.0.0.1:5441:5432"
+    environment:
+      POSTGRES_DB: medimate_phase7_db
+      POSTGRES_USER: medimate_admin
+      POSTGRES_PASSWORD: medimate_admin_pw
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U medimate_admin -d medimate_phase7_db"]
+      interval: 3s
+      timeout: 3s
+      retries: 5
+    networks:
+      - medimate-phase7-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: medimate-phase7-redis
+    restart: "no"
+    ports:
+      - "127.0.0.1:6384:6379"
+    command: ["redis-server", "--requirepass", "medimate_redis_phase7_pw", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "medimate_redis_phase7_pw", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 5
+    networks:
+      - medimate-phase7-net
+
+  medimate-rag:
+    image: medimate-rag:phase6-1
+    container_name: medimate-phase7-rag
+    restart: "no"
+    ports:
+      - "127.0.0.1:8003:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - INTERNAL_SERVICE_SECRET=phase7_secret_verification_key_for_testing_purposes_only_32bytes
+      - ENVIRONMENT=local
+      - REDIS_URL=redis://:medimate_redis_phase7_pw@redis:6379/0
+      - DATABASE_URL=postgresql://medimate_admin:medimate_admin_pw@postgres:5432/medimate_phase7_db
+      - VECTOR_STORE_BACKEND=pgvector
+      - EMBEDDING_PROVIDER=deterministic
+      - SIMILARITY_THRESHOLD=0.05
+    tmpfs:
+      - /tmp/rag-scratch:size=64m,mode=1777
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks:
+      - medimate-phase7-net
+
+networks:
+  medimate-phase7-net:
+    driver: bridge

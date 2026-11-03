@@ -14,7 +14,11 @@ export type SecurityAuditEventType =
   | 'RATE_LIMIT_EXCEEDED'
   | 'BACKUP_CREATED'
   | 'BACKUP_RESTORED'
-  | 'SECURITY_VIOLATION';
+  | 'SECURITY_VIOLATION'
+  | 'WEARABLE_SYNC_SUCCESS'
+  | 'WEARABLE_SYNC_FAILED'
+  | 'PROVIDER_DISCONNECTED'
+  | 'ACCESS_DENIED';
 
 export interface SecurityAuditEvent {
   eventType: SecurityAuditEventType;
@@ -90,6 +94,10 @@ export class SecurityAuditLogger {
       SecurityAuditLogger.instance = new SecurityAuditLogger();
     }
     return SecurityAuditLogger.instance;
+  }
+
+  public static log(event: SecurityAuditEvent): void {
+    SecurityAuditLogger.getInstance().logEvent(event);
   }
 
   public logEvent(event: SecurityAuditEvent): void {

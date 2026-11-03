@@ -7,7 +7,7 @@ import { WearableSyncEngine } from '../sync';
 import { WearableRAGSummaryService } from '../rag-summary';
 import { WearableDeletionService } from '../deletion';
 import { ragClient } from '@/lib/rag/rag-client';
-import { NormalizedObservation, WearableSummary } from '../types';
+import { WearableSummary } from '../types';
 
 vi.mock('@/lib/rag/rag-client', () => ({
   ragClient: {

@@ -27,6 +27,8 @@ model User {
   OAuth2Token             OAuth2Token[]
   wearableConnections     WearableConnection[]
   wearableConsents        WearableConsent[]
+  healthMemories          UserHealthMemory[]
+  healthReminders         HealthReminder[]
 }
 
 model OAuth2Client {
@@ -129,6 +131,44 @@ model WearableConsent {
 
   @@unique([userId, providerId])
   @@index([userId])
+}
+
+model UserHealthMemory {
+  id         String   @id @default(cuid())
+  userId     String   @map("user_id")
+  category   String   @map("category") // PREFERENCE, GOAL, TOPIC, CONVERSATION_SUMMARY
+  key        String   @map("key")
+  content    String   @map("content")
+  sourceType String   @default("USER_EXPLICIT") @map("source_type") // USER_EXPLICIT, CONVERSATION_SUMMARY
+  sourceId   String?  @map("source_id")
+  confidence Float    @default(1.0) @map("confidence")
+  isPaused   Boolean  @default(false) @map("is_paused")
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, category])
+  @@index([userId, key])
+}
+
+model HealthReminder {
+  id              String    @id @default(cuid())
+  userId          String    @map("user_id")
+  title           String    @map("title")
+  description     String?   @map("description")
+  category        String    @map("category") // MEDICATION_REMINDER, MEASUREMENT_REMINDER, ACTIVITY_GOAL, APPOINTMENT
+  scheduleType    String    @map("schedule_type") // DAILY, WEEKLY, ONE_OFF
+  scheduleTime    String    @map("schedule_time") // e.g. "08:00" or ISO date
+  isEnabled       Boolean   @default(true) @map("is_enabled")
+  lastTriggeredAt DateTime? @map("last_triggered_at")
+  metadata        Json?     @map("metadata")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, isEnabled])
 }
 
 model ChatRoom {

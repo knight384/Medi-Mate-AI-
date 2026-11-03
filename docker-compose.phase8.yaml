@@ -1,0 +1,85 @@
+services:
+  postgres-phase8:
+    image: pgvector/pgvector:pg16
+    container_name: medimate-phase8-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: medimate_app
+      POSTGRES_PASSWORD: medimate_phase8_password
+      POSTGRES_DB: medimate_phase8_db
+    ports:
+      - "5442:5432"
+    volumes:
+      - medimate_phase8_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U medimate_app -d medimate_phase8_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis-phase8:
+    image: redis:7-alpine
+    container_name: medimate-phase8-redis
+    restart: unless-stopped
+    ports:
+      - "6385:6379"
+    volumes:
+      - medimate_phase8_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  medimate-rag-phase8:
+    build:
+      context: ./services/medimate-rag
+      dockerfile: Dockerfile
+    container_name: medimate-phase8-rag
+    restart: unless-stopped
+    ports:
+      - "8004:8000"
+    environment:
+      RAG_PORT: 8000
+      RAG_SERVICE_SECRET: phase8_rag_internal_secret_key_32chars_min!!
+      DATABASE_URL: postgresql://medimate_app:medimate_phase8_password@postgres-phase8:5432/medimate_phase8_db
+      REDIS_URL: redis://redis-phase8:6379/0
+      EMBEDDING_PROVIDER: fastembed
+      VECTOR_STORE_BACKEND: postgres
+    depends_on:
+      postgres-phase8:
+        condition: service_healthy
+      redis-phase8:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  web-phase8:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    container_name: medimate-phase8-web
+    restart: unless-stopped
+    ports:
+      - "3006:3000"
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://medimate_app:medimate_phase8_password@postgres-phase8:5432/medimate_phase8_db
+      REDIS_URL: redis://redis-phase8:6379/0
+      RAG_SERVICE_URL: http://medimate-rag-phase8:8000
+      RAG_SERVICE_SECRET: phase8_rag_internal_secret_key_32chars_min!!
+      AUTH_SECRET: phase8_auth_secret_key_super_secure_32chars!!
+      LOCAL_ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      MEDIMATE_DEPLOYMENT_MODE: LOCAL
+    depends_on:
+      postgres-phase8:
+        condition: service_healthy
+      redis-phase8:
+        condition: service_healthy
+
+volumes:
+  medimate_phase8_pg_data:
+  medimate_phase8_redis_data:

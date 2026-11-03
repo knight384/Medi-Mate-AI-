@@ -13,7 +13,7 @@ import { withTenantContext } from "@/lib/db-tenant";
 import { buildClinicalSystemPrompt } from "@/lib/clinical/emergency-guidance";
 import { checkRateLimit } from "@/lib/security/rate-limiter";
 import { ConsentAndPrivacyPolicy } from "@/lib/ai/consent-policy";
-import { ragClient } from "@/lib/rag/rag-client";
+import { HealthContextEngine } from "@/lib/health-intelligence";
 
 export interface ChatMessage extends Prisma.ChatMessageGetPayload<{
     select: {
@@ -147,25 +147,18 @@ export async function POST(
 
     const userRegion = req.headers.get('x-user-region') || undefined;
 
-    // Retrieve relevant clinical records from Python RAG microservice
-    let ragContext = '';
+    // Aggregate multi-modal context: documents (RAG), labs, wearable telemetry, and health memory
+    let patientSummary = '';
     try {
-        const ragRes = await ragClient.queryRAG({
-            userId,
+        const aggregated = await HealthContextEngine.aggregateContext(userId, {
             query: body.content,
-            topK: 4,
+            includeRag: true,
+            maxObservations: 20,
         });
-        if (ragRes && ragRes.citations && ragRes.citations.length > 0) {
-            ragContext = '\n\nRELEVANT RETRIEVED MEDICAL RECORDS:\n' +
-                ragRes.citations
-                    .map((c) => `[Document: ${c.document_name}, Page: ${c.page_number}, Section: ${c.section_heading}]:\n${c.excerpt}`)
-                    .join('\n\n');
-        }
+        patientSummary = HealthContextEngine.formatForPrompt(aggregated);
     } catch {
-        // Fall back gracefully if RAG service is offline or unprovisioned
+        patientSummary = healthDataList.map((data) => JSON.stringify(data.data)).join('\n');
     }
-
-    const patientSummary = healthDataList.map((data) => JSON.stringify(data.data)).join('\n') + ragContext;
 
     const systemPrompt = buildClinicalSystemPrompt({
         regionCode: userRegion,
@@ -243,7 +236,7 @@ export async function POST(
                 let messageContent = ''
                 for await (const chunk of stream) {
                     messageContent += chunk.text
-                    controller.enqueue(`${JSON.stringify({text: chunk.text})}\n`);
+                    controller.enqueue(`${JSON.stringify({content: chunk.text, text: chunk.text})}\n`);
                 }
 
                 await withTenantContext(userId, async (tx) => {

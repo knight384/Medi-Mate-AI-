@@ -1,0 +1,149 @@
+services:
+  postgres-prod:
+    image: pgvector/pgvector:pg16
+    container_name: medimate-prod-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: medimate_admin
+      POSTGRES_PASSWORD: ${DB_ADMIN_PASSWORD:-medimate_prod_admin_secret_key_change_in_vault}
+      POSTGRES_DB: medimate_prod_db
+      APP_DB_USER: medimate_app
+      APP_DB_PASSWORD: ${DB_APP_PASSWORD:-medimate_prod_app_secret_least_privilege}
+      OWNER_DB_USER: medimate_owner
+      OWNER_DB_PASSWORD: ${DB_OWNER_PASSWORD:-medimate_prod_owner_secret_migration}
+    volumes:
+      - medimate_prod_pgdata:/var/lib/postgresql/data
+      - ./web/docker/init-db/01-init-roles.sh:/docker-entrypoint-initdb.d/01-init-roles.sh:ro
+      - ./web/docker/init-db/02-init-rls.sql:/docker-entrypoint-initdb.d/02-init-rls.sql:ro
+    ports:
+      # Bound strictly to loopback 127.0.0.1 on isolated port 5444 for administrative/migration use
+      - "127.0.0.1:5444:5432"
+    networks:
+      - medimate-prod-internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U medimate_admin -d medimate_prod_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2048M
+        reservations:
+          memory: 512M
+
+  redis-prod:
+    image: redis:7-alpine
+    container_name: medimate-prod-redis
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:-medimate_prod_redis_secure_pass}", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "volatile-lru"]
+    volumes:
+      - medimate_prod_redis_data:/data
+    ports:
+      # Bound strictly to loopback 127.0.0.1 on port 6387
+      - "127.0.0.1:6387:6379"
+    networks:
+      - medimate-prod-internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-medimate_prod_redis_secure_pass}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+
+  medimate-rag-prod:
+    build:
+      context: ./services/medimate-rag
+      dockerfile: Dockerfile
+    container_name: medimate-prod-rag
+    restart: unless-stopped
+    environment:
+      ENVIRONMENT: production
+      RAG_SERVICE_HOST: 0.0.0.0
+      RAG_SERVICE_PORT: 8000
+      RAG_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET:-phase10_rag_internal_secret_key_32chars_min!!}
+      DATABASE_URL: postgresql://medimate_app:${DB_APP_PASSWORD:-medimate_prod_app_secret_least_privilege}@postgres-prod:5432/medimate_prod_db
+      REDIS_URL: redis://:${REDIS_PASSWORD:-medimate_prod_redis_secure_pass}@redis-prod:6379/0
+      EMBEDDING_PROVIDER: fastembed
+      VECTOR_STORE_BACKEND: postgres
+      PROTECTED_SCRATCH_DIR: /tmp/rag-scratch
+    tmpfs:
+      - /tmp/rag-scratch:size=256M,mode=1777
+    networks:
+      - medimate-prod-internal
+    depends_on:
+      postgres-prod:
+        condition: service_healthy
+      redis-prod:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live')"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2048M
+
+  web-prod:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    container_name: medimate-prod-web
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      HOSTNAME: "0.0.0.0"
+      MEDIMATE_DEPLOYMENT_MODE: LOCAL
+      DATABASE_URL: postgresql://medimate_app:${DB_APP_PASSWORD:-medimate_prod_app_secret_least_privilege}@postgres-prod:5432/medimate_prod_db
+      MIGRATION_DATABASE_URL: postgresql://medimate_owner:${DB_OWNER_PASSWORD:-medimate_prod_owner_secret_migration}@postgres-prod:5432/medimate_prod_db
+      REDIS_URL: redis://:${REDIS_PASSWORD:-medimate_prod_redis_secure_pass}@redis-prod:6379/0
+      RAG_SERVICE_URL: http://medimate-rag-prod:8000
+      INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET:-phase10_rag_internal_secret_key_32chars_min!!}
+      AUTH_SECRET: ${AUTH_SECRET:-phase10_auth_secret_key_super_secure_32chars!!}
+      LOCAL_ENCRYPTION_KEY: ${LOCAL_ENCRYPTION_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+      BACKUP_ENCRYPTION_KEY: ${BACKUP_ENCRYPTION_KEY:-fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210}
+      PROTECTED_SCRATCH_DIR: /tmp/scratch
+    tmpfs:
+      - /tmp/scratch:size=256M,mode=1700
+    ports:
+      - "127.0.0.1:3008:3000"
+    networks:
+      - medimate-prod-internal
+      - medimate-prod-public
+    depends_on:
+      postgres-prod:
+        condition: service_healthy
+      redis-prod:
+        condition: service_healthy
+      medimate-rag-prod:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:3000/api/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2048M
+
+networks:
+  medimate-prod-internal:
+    driver: bridge
+    internal: true
+  medimate-prod-public:
+    driver: bridge
+
+volumes:
+  medimate_prod_pgdata:
+  medimate_prod_redis_data:

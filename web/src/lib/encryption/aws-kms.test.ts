@@ -13,8 +13,8 @@ describe('AWS KMS Integration & Envelope Key Lifecycle', () => {
       endpoint,
       region: 'us-east-1',
       service: 'kms',
-      accessKeyId: 'AKIAIOSFODNN7EXAMPLE',
-      secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+      accessKeyId: 'TEST_MOCK_AWS_ACCESS_KEY_ID_01',
+      secretAccessKey: 'TEST_MOCK_AWS_SECRET_KEY_FOR_SIGV4_CALCULATION',
       amzTarget: 'TrentService.GenerateDataKey',
       body: JSON.stringify({ KeyId: 'test-arn', KeySpec: 'AES_256' }),
       date: fixedDate,
@@ -25,7 +25,7 @@ describe('AWS KMS Integration & Envelope Key Lifecycle', () => {
     expect(headers['x-amz-date']).toBe('20261102T120000Z');
     expect(headers['x-amz-target']).toBe('TrentService.GenerateDataKey');
     expect(headers.Authorization).toContain('AWS4-HMAC-SHA256');
-    expect(headers.Authorization).toContain('Credential=AKIAIOSFODNN7EXAMPLE/20261102/us-east-1/kms/aws4_request');
+    expect(headers.Authorization).toContain('Credential=TEST_MOCK_AWS_ACCESS_KEY_ID_01/20261102/us-east-1/kms/aws4_request');
     expect(headers.Authorization).toContain('SignedHeaders=content-type;host;x-amz-date;x-amz-target');
   });
 
